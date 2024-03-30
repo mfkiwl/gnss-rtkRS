@@ -17,14 +17,17 @@ pub enum Error {
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize))]
 pub enum Method {
-    /// Single Point Positioning (SPP).
-    /// Uses pseudorange observations from a single carrier signal.
-    /// There is not point providing carrier phase obserations with this method.
+    /// Code Based Single Point Positioning (SPP).
+    /// Uses Pseudo Range code observations from a single carrier signal.
+    /// There is no point providing signal phase observations with this method.
     /// SPP can work in degraged environments where a unique signal is sampled.
-    /// Combine this to advanced configurations and you may obtain metric precision.
+    /// Combine this to advanced configurations and high quality data, you may obtain metric precision.
     #[default]
     SPP,
-    /// Precise Point Positioning (PPP)
+    /// Code Based Precise Point Positioning (PPP).
+    /// Uses Pseudo Range code observations in dual frequency cross mixing.
+    /// There is no point providing Ionosphere Model with this method.
+    /// Combine this to advanced configurations and high quality data, you may obtain sub metric precision.
     PPP,
 }
 
@@ -44,22 +47,17 @@ pub enum Positioning {
     /// Receiver is static
     #[default]
     Static,
-    /// Receiver is moving
-    Kinematic,
 }
 
 /// Filter to use in the solving process
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize))]
 pub enum Filter {
-    /// No filter. The "filter" part of the
-    /// [Config] struct is disregarded
+    /// No filter. The "filter" part of the [Config] struct is disregarded
     None,
     /// LSQ Filter. Heavy computation, converges much slower than a Kalman filter.
     #[default]
     LSQ,
-    /// Kalman Filter. Heavy+ computation, converges much faster than LSQ.
-    KF,
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -270,13 +268,14 @@ impl Modeling {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize))]
 pub struct Config {
-    /// Time scale
+    /// [TimeScale].
     #[cfg_attr(feature = "serde", serde(default = "default_timescale"))]
     pub timescale: TimeScale,
-    /// Method to use
+    /// Desired resolution [Method].
     #[cfg_attr(feature = "serde", serde(default))]
     pub method: Method,
     /// (Position) interpolation filter order.
+    /// This solver currently only supports Odd interpolation orders.
     /// A minimal order must be respected for correct results.
     /// -  7 is the minimal value for metric resolution
     /// - 11 is the standard when aiming at submetric resolution
@@ -313,7 +312,7 @@ pub struct Config {
     /// Minimal elevation angle. SV below that angle will not be considered.
     #[cfg_attr(feature = "serde", serde(default))]
     pub min_sv_elev: Option<f64>,
-    /// Minimal SNR for an SV to be considered.
+    /// Minimal Observation SNR for a signal observation to be considered.
     #[cfg_attr(feature = "serde", serde(default))]
     pub min_snr: Option<f64>,
     /// modeling
@@ -326,6 +325,8 @@ pub struct Config {
 }
 
 impl Config {
+    /// Helper to generate correct [Config] preset
+    /// for targetted resolution [Method].
     pub fn preset(method: Method) -> Self {
         match method {
             Method::SPP => Self {
@@ -335,8 +336,8 @@ impl Config {
                 interp_order: default_interp(),
                 code_smoothing: default_smoothing(),
                 min_sv_sunlight_rate: None,
-                min_sv_elev: Some(15.0),
-                min_snr: Some(30.0),
+                min_sv_elev: None, //Some(15.0), //FIXME
+                min_snr: None,     //Some(30.0), // FIXME
                 modeling: Modeling::default(),
                 max_sv: default_max_sv(),
                 int_delay: Default::default(),

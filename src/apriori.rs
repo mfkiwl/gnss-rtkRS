@@ -3,11 +3,19 @@ use map_3d::{ecef2geodetic, geodetic2ecef, Ellipsoid};
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct AprioriPosition {
-    pub ecef: Vector3<f64>,
-    pub geodetic: Vector3<f64>,
+    ecef: Vector3<f64>,
+    geodetic: Vector3<f64>,
 }
 
 impl AprioriPosition {
+    /// Returns Geodetic coordinates in degrees
+    pub fn geodetic(&self) -> Vector3<f64> {
+        self.geodetic
+    }
+    /// Returns coordinates in ECEF [m]
+    pub fn ecef(&self) -> Vector3<f64> {
+        self.ecef
+    }
     /// Builds Self from ECEF position [m]
     pub fn from_ecef(ecef: Vector3<f64>) -> Self {
         let (x, y, z) = (ecef[0], ecef[1], ecef[2]);

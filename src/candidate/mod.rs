@@ -1,5 +1,4 @@
 //! Position solving candidate
-
 use gnss::prelude::SV;
 use hifitime::Unit;
 use itertools::Itertools;
@@ -16,38 +15,17 @@ use crate::{
     Error,
 };
 
-/// Signal observation to attach to each candidate
-#[derive(Debug, Default, Clone)]
-pub struct Observation {
-    /// carrier frequency [Hz]
-    pub frequency: f64,
-    /// actual observation
-    pub value: f64,
-    /// optional (but recommended) SNR in [dB]
-    pub snr: Option<f64>,
-}
-
 /// Position solving candidate
 #[derive(Debug, Clone)]
 pub struct Candidate {
     /// SV
     pub sv: SV,
-    /// Signal sampling Epoch
-    pub t: Epoch,
-    /// state that needs to be resolved
-    pub state: Option<InterpolationResult>,
-    // SV group delay
-    pub(crate) tgd: Option<Duration>,
-    // SV clock state (compared to GNSS timescale)
-    pub(crate) clock_state: Vector3<f64>,
+    /// Current state
+    pub state: State,
+    /// Total Group Delay (if known)
+    pub tgd: Option<Duration>,
     // SV clock correction
     pub(crate) clock_corr: Duration,
-    // Code observations
-    pub(crate) code: Vec<Observation>,
-    // Phase observations
-    pub(crate) phase: Vec<Observation>,
-    // Doppler observations
-    pub(crate) doppler: Vec<Observation>,
 }
 
 impl Candidate {

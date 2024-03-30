@@ -2,11 +2,15 @@
 use crate::prelude::{Filter, Vector3, SV};
 use crate::solver::{FilterState, LSQState};
 use crate::Error;
+use hifitime::Epoch;
 use std::collections::HashMap;
 
-pub(crate) mod validator;
+// pub(crate) mod validator;
 
-#[derive(Debug, Copy, Clone, Default)]
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Copy, Clone, PartialEq, Default)]
 pub enum PVTSolutionType {
     /// Default, complete solution with Position,
     /// Velocity and Time components. Requires either
@@ -32,9 +36,6 @@ impl std::fmt::Display for PVTSolutionType {
 
 use nalgebra::base::{DMatrix, DVector, Matrix3, Matrix4, MatrixXx4};
 use nyx::cosmic::SPEED_OF_LIGHT;
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
 
 /// Modeled (estimated) or measured Time Delay.
 #[derive(Debug, Copy, Clone, Default)]
@@ -93,6 +94,8 @@ pub struct PVTSVData {
 #[derive(Debug, Clone, Default)]
 // #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct PVTSolution {
+    /// Signal Sampline Epoch
+    pub epoch: Epoch,
     /// Position errors (in [m] ECEF)
     pub pos: Vector3<f64>,
     /// Absolute Velocity (in [m/s] ECEF).
@@ -113,6 +116,7 @@ impl PVTSolution {
     /// "y": the navigation vector
     /// "sv": attached SV data
     pub(crate) fn new(
+        epoch: Epoch,
         g: MatrixXx4<f64>,
         w: DMatrix<f64>,
         y: DVector<f64>,
@@ -167,28 +171,28 @@ impl PVTSolution {
                     (q, x, Some(FilterState::LSQState(LSQState { x, p })))
                 }
             },
-            Filter::KF => {
-                panic!("kalman filter not available yet");
-                //if let Some(FilterState::KfState(p_state)) = p_state {
-                //    let g_prime = g.clone().transpose();
-                //    let q = (g_prime.clone() * g.clone())
-                //        .try_inverse()
-                //        .ok_or(Error::MatrixInversionError)?;
+            //Filter::KF => {
+            //    panic!("kalman filter not available yet");
+            //if let Some(FilterState::KfState(p_state)) = p_state {
+            //    let g_prime = g.clone().transpose();
+            //    let q = (g_prime.clone() * g.clone())
+            //        .try_inverse()
+            //        .ok_or(Error::MatrixInversionError)?;
 
-                //    //let p = (g_prime.clone() * w.clone() * g.clone())
-                //    //    .try_inverse()
-                //    //    .ok_or(Error::MatrixInversionError)?;
-                //    //
-                //    //let x = (p * g_prime.clone()) * w.clone() * y;
-                //    //
-                //    //(q, x, Some(FilterState::KfState(KfState {
-                //    //    x,
-                //    //    p,
-                //    //})))
-                //} else {
-                //    return Err(Error::UninitializedKalmanFilter);
-                //}
-            },
+            //    //let p = (g_prime.clone() * w.clone() * g.clone())
+            //    //    .try_inverse()
+            //    //    .ok_or(Error::MatrixInversionError)?;
+            //    //
+            //    //let x = (p * g_prime.clone()) * w.clone() * y;
+            //    //
+            //    //(q, x, Some(FilterState::KfState(KfState {
+            //    //    x,
+            //    //    p,
+            //    //})))
+            //} else {
+            //    return Err(Error::UninitializedKalmanFilter);
+            //}
+            //},
         };
 
         let dt = x[3] / SPEED_OF_LIGHT;
@@ -198,6 +202,7 @@ impl PVTSolution {
 
         Ok((
             (Self {
+                epoch,
                 sv,
                 pos: Vector3::new(x[0], x[1], x[2]),
                 vel: Vector3::<f64>::default(),
