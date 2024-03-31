@@ -12,14 +12,12 @@ mod solutions;
 mod solver;
 
 mod clock;
+mod interpolator;
 mod observation;
 mod orbit;
 
 // pub export
 pub use solver::Error;
-
-#[cfg(test)]
-mod tests;
 
 // prelude
 pub mod prelude {

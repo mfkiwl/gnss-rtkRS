@@ -275,7 +275,7 @@ pub struct Config {
     #[cfg_attr(feature = "serde", serde(default))]
     pub method: Method,
     /// (Position) interpolation filter order.
-    /// This solver currently only supports Odd interpolation orders.
+    /// <!> This solver currently only supports Odd interpolation orders <!>.
     /// A minimal order must be respected for correct results.
     /// -  7 is the minimal value for metric resolution
     /// - 11 is the standard when aiming at submetric resolution

@@ -1,8 +1,9 @@
 //! PVT solver
 
 use hifitime::{Epoch, Unit};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use map_3d::deg2rad;
+use std::collections::HashMap;
 use thiserror::Error;
 
 use nyx::cosmic::eclipse::{eclipse_state, EclipseState};
@@ -91,15 +92,15 @@ pub(crate) enum FilterState {
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
 enum State {
-    /// Need carrier signal measurements
+    /// Clock data gathering
     #[default]
+    ClockGathering,
+    /// Need carrier signal measurements
     SignalAcquisition,
     /// Signal quality filter
     SignalFilter,
     /// SV clock interpolation
     ClockInterpolation,
-    /// SV orbital state interpolation
-    OrbitInterpolation,
     /// Processing
     Processing,
 }
@@ -120,7 +121,7 @@ pub struct Solver {
     /// Orbital states buffer
     orbits: Vec<Orbit>,
     /// Observations buffer
-    observations: Vec<Observation>,
+    signals: Vec<Observation>,
     /// Cosmic model
     cosmic: Arc<Cosm>,
     /// (Reference) Earth frame.
@@ -170,7 +171,12 @@ impl Solver {
         if cfg.modeling.relativistic_path_range {
             warn!("relativistic path range modeling is not supported at the moment");
         }
+
         let interp_order = cfg.interp_order;
+        if interp_order % 2 == 0 {
+            panic!("only odd interpolation orders are supported");
+        }
+
         Self {
             cfg,
             cosmic,
@@ -179,7 +185,7 @@ impl Solver {
             earth_frame,
             solutions_type,
             state: State::default(),
-            observations: Vec::<Observation>::with_capacity(64),
+            signals: Vec::<Observation>::with_capacity(64),
             clocks: Vec::<Clock>::with_capacity(interp_order),
             orbits: Vec::<Orbit>::with_capacity(interp_order),
         }
@@ -187,7 +193,7 @@ impl Solver {
     /// Runs signal quality filter
     fn signal_quality_filter(&mut self) {
         if let Some(min_snr) = self.cfg.min_snr {
-            self.observations
+            self.signals
                 .retain(|obs| obs.snr_db.unwrap_or(-200.0) > min_snr);
         }
     }
@@ -210,18 +216,21 @@ impl Solver {
         State::default()
     }
 
-    /// Try to resolve one PVTSolution by sourcing [Observation]s, [Clock] states and
-    /// [Orbit]al states. Solver's behavior highly depends on [Config] preset and the desired [PVTSolutionType].
-    /// Returns Ok(None) if Solver is not in position at the moment to resolve.
+    /// Try to resolve PVTSolution by exploiting [Observation]s, [Clock] and
+    /// [Orbit]al states sources. Solver's behavior highly depends on [Config] preset
+    /// and the desired [PVTSolutionType].
     pub fn resolve<O: ObservationIter, CK: ClockIter>(
         &mut self,
         mut observation: O,
         mut clock: CK,
     ) -> Result<Vec<PVTSolution>, Error> {
+        let interp_ord = self.cfg.interp_order;
+
         let min_sv_required =
             Self::min_sv_required(self.solutions_type, self.cfg.fixed_altitude.is_some());
 
         let mut current_samp_t = Epoch::default();
+        let mut interpolated_ck = HashMap::<SV, f64>::with_capacity(min_sv_required);
 
         loop {
             debug!("{} - {:?}", self.cfg.method, self.state);
@@ -232,17 +241,16 @@ impl Solver {
                      */
                     loop {
                         if let Some(obs) = observation.next() {
-                            debug!("{} ({}) - new observation", obs.epoch, obs.sv);
-                            self.observations.push(obs);
+                            debug!("{:?} ({}) - new observation", obs.epoch, obs.sv);
+                            self.signals.push(obs);
                         }
-                        // can always process one signal sampling at a time..
                         if self
-                            .observations
+                            .signals
                             .iter()
-                            .map(|obs| obs.epoch)
+                            .map(|obs| (obs.sv, obs.epoch))
                             .unique()
                             .count()
-                            > 1
+                            > min_sv_required
                         {
                             self.state = State::SignalFilter;
                             break;
@@ -251,7 +259,7 @@ impl Solver {
                 },
                 State::SignalFilter => {
                     current_samp_t = self
-                        .observations
+                        .signals
                         .iter()
                         .min_by(|a, b| a.epoch.cmp(&b.epoch))
                         .unwrap()
@@ -262,29 +270,112 @@ impl Solver {
                     // TODO:
                     // needs to be more complex for PPP
                     let count = self
-                        .observations
+                        .signals
                         .iter()
                         .filter(|obs| obs.epoch == current_samp_t)
                         .count();
 
                     if count >= min_sv_required {
                         debug!(
-                            "{} - {} observations passed quality checks",
+                            "{:?} - {} observations passed quality checks",
                             current_samp_t, count
                         );
-                        self.state = State::ClockInterpolation;
+                        self.state = State::ClockGathering;
                     } else {
                         warn!(
-                            "{} - too many samples below quality criteria",
+                            "{:?} - too many samples below quality criteria",
                             current_samp_t
                         );
                         self.state = State::SignalAcquisition;
                     }
                 },
-                State::ClockInterpolation => {
-                    while let Some(ck) = clock.next() {
-                        self.clocks.push(ck);
+                State::ClockGathering => {
+                    let sv_list = self
+                        .signals
+                        .iter()
+                        .map(|sig| sig.sv)
+                        .unique()
+                        .collect::<Vec<_>>();
+                    loop {
+                        if let Some(ck) = clock.next() {
+                            if sv_list.contains(&ck.sv) {
+                                debug!("{:?} ({}) - new clock state", ck.epoch, ck.sv);
+                                self.clocks.push(ck);
+                            } else {
+                                debug!("{:?} ({}) - dropped clock state", ck.epoch, ck.sv);
+                            }
+                        } else {
+                            warn!("{:?} - consumed all clock states", current_samp_t);
+                            return Err(Error::UnfitObservations);
+                        }
+                        //TODO: should take into account the possibility
+                        //      we don't have to interpolate.. for best performances
+                        let mut ready = true;
+
+                        for signal in &self.signals {
+                            let before_t = self
+                                .clocks
+                                .iter()
+                                .filter(|ck| ck.sv == signal.sv && ck.epoch <= current_samp_t)
+                                .count();
+                            let after_t = self
+                                .clocks
+                                .iter()
+                                .filter(|ck| ck.sv == signal.sv && ck.epoch > current_samp_t)
+                                .count();
+                            let total = before_t + after_t;
+                            if total < 3 {
+                                debug!("{:?} ({}/{})", current_samp_t, total, 3);
+                                ready = false;
+                            } else {
+                                debug!("{:?} ({}/{}) - ready", current_samp_t, total, 3);
+                            }
+                        }
+                        if ready {
+                            self.state = State::ClockInterpolation;
+                            break;
+                        }
                     }
+                },
+                State::ClockInterpolation => {
+                    //TODO: should take into account the possibility
+                    //      we don't have to interpolate.. for best performances
+                    let sv = self.signals.iter().map(|sig| sig.sv).unique();
+                    for sv in sv {
+                        let before = self
+                            .clocks
+                            .iter()
+                            .filter_map(|ck| {
+                                if ck.sv == sv && ck.epoch <= current_samp_t {
+                                    Some((ck.epoch, ck.offset))
+                                } else {
+                                    None
+                                }
+                            })
+                            .last()
+                            .unwrap();
+                        let after = self
+                            .clocks
+                            .iter()
+                            .filter_map(|ck| {
+                                if ck.sv == sv && ck.epoch <= current_samp_t {
+                                    Some((ck.epoch, ck.offset))
+                                } else {
+                                    None
+                                }
+                            })
+                            .reduce(|k, _| k)
+                            .unwrap();
+
+                        let (before_t, before_bias) = before;
+                        let (after_t, after_bias) = after;
+                        let dt = (after_t - before_t).to_seconds();
+                        let mut bias = (after_t - current_samp_t).to_seconds() / dt * before_bias;
+                        bias += (current_samp_t - before_t).to_seconds() / dt * after_bias;
+                        interpolated_ck.insert(sv, bias);
+                        debug!("{:?} ({}) interpolated {} [s]", current_samp_t, sv, bias);
+                    }
+                    return Err(Error::UnfitObservations);
                 },
                 _ => return Err(Error::UnfitObservations),
             }

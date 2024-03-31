@@ -4,6 +4,10 @@ use hifitime::Epoch;
 /// Implement this trait to provide SV Clock States
 pub trait ClockIter {
     /// Provide Clock states in chronological order.
+    /// In order to simplify internal logic, we will panic if Clock states
+    /// are not provided in chronological order.
+    /// Unevenly spaced states (in time) will delay PVT solution production,
+    /// as we maintain steady interpolation errors.
     fn next(&mut self) -> Option<Clock>;
 }
 
