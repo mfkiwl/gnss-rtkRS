@@ -8,13 +8,12 @@ extern crate nyx_space as nyx;
 mod apriori;
 mod bias;
 mod cfg;
-mod solutions;
-mod solver;
-
 mod clock;
-mod interpolator;
+mod interp;
 mod observation;
 mod orbit;
+mod solutions;
+mod solver;
 
 // pub export
 pub use solver::Error;
