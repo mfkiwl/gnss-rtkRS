@@ -22,7 +22,7 @@ use crate::{
     bias::{IonosphericBias, TroposphericBias},
     cfg::{Config, Filter, Method},
     clock::{Clock, ClockIter},
-    interp::{Interpolator, PositionInterpolator, TimeInterpolator},
+    interp::{ClockInterpolator, OrbitInterpolator},
     observation::{Observation, ObservationIter},
     orbit::{Orbit, OrbitIter},
     solutions::{PVTSVData, PVTSolution, PVTSolutionType},
@@ -112,72 +112,6 @@ enum State {
     Navigation,
     /// Solution Validation
     Validation,
-}
-
-#[derive(Debug)]
-struct ClockInterpolator {
-    size: usize,
-    pub interpolators: HashMap<SV, TimeInterpolator>,
-}
-
-impl ClockInterpolator {
-    pub fn malloc(size: usize) -> Self {
-        Self {
-            size,
-            interpolators: HashMap::<SV, TimeInterpolator>::with_capacity(size),
-        }
-    }
-    pub fn new_clock(&mut self, ck: Clock) {
-        if let Some(interp) = self.interpolators.get_mut(&ck.sv) {
-            interp.push((ck.epoch, ck.offset));
-        } else {
-            let mut interp = TimeInterpolator::new(self.size);
-            interp.push((ck.epoch, ck.offset));
-            self.interpolators.insert(ck.sv, interp);
-        }
-    }
-    pub fn interpolate(&self, sv: SV, t_k: Epoch) -> Option<Clock> {
-        let interp = self
-            .interpolators
-            .iter()
-            .filter_map(|(k, v)| if *k == sv { Some(v) } else { None })
-            .reduce(|k, _| k)?;
-        let offset = interp.interpolate(t_k)?;
-        Some(Clock::new(sv, t_k, offset, None, None)) // TODO: drift + drift/r
-    }
-}
-
-#[derive(Debug)]
-struct OrbitInterpolator {
-    order: usize,
-    pub interpolators: HashMap<SV, PositionInterpolator>,
-}
-
-impl OrbitInterpolator {
-    pub fn malloc(order: usize, size: usize) -> Self {
-        Self {
-            order,
-            interpolators: HashMap::<SV, PositionInterpolator>::with_capacity(size),
-        }
-    }
-    pub fn new_orbit(&mut self, orb: Orbit) {
-        if let Some(interp) = self.interpolators.get_mut(&orb.sv) {
-            interp.push((orb.epoch, (orb.position.0, orb.position.1, orb.position.2)));
-        } else {
-            let mut interp = PositionInterpolator::new(self.order);
-            interp.push((orb.epoch, (orb.position.0, orb.position.1, orb.position.2)));
-            self.interpolators.insert(orb.sv, interp);
-        }
-    }
-    pub fn interpolate(&self, sv: SV, t_k: Epoch, apriori: &AprioriPosition) -> Option<Orbit> {
-        let interp = self
-            .interpolators
-            .iter()
-            .filter_map(|(k, v)| if *k == sv { Some(v) } else { None })
-            .reduce(|k, _| k)?;
-        let pos = interp.interpolate(t_k)?;
-        Some(Orbit::position(sv, t_k, pos, apriori))
-    }
 }
 
 /// PVT Solver

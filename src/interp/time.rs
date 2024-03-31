@@ -1,6 +1,42 @@
-use crate::interp::Interpolator;
+use gnss::prelude::SV;
 use hifitime::{Duration, Epoch};
 use log::debug;
+use std::collections::HashMap;
+
+use crate::{clock::Clock, interp::Interpolator};
+
+#[derive(Debug)]
+pub struct ClockInterpolator {
+    size: usize,
+    pub interpolators: HashMap<SV, TimeInterpolator>,
+}
+
+impl ClockInterpolator {
+    pub fn malloc(size: usize) -> Self {
+        Self {
+            size,
+            interpolators: HashMap::<SV, TimeInterpolator>::with_capacity(size),
+        }
+    }
+    pub fn new_clock(&mut self, ck: Clock) {
+        if let Some(interp) = self.interpolators.get_mut(&ck.sv) {
+            interp.push((ck.epoch, ck.offset));
+        } else {
+            let mut interp = TimeInterpolator::new(self.size);
+            interp.push((ck.epoch, ck.offset));
+            self.interpolators.insert(ck.sv, interp);
+        }
+    }
+    pub fn interpolate(&self, sv: SV, t_k: Epoch) -> Option<Clock> {
+        let interp = self
+            .interpolators
+            .iter()
+            .filter_map(|(k, v)| if *k == sv { Some(v) } else { None })
+            .reduce(|k, _| k)?;
+        let offset = interp.interpolate(t_k)?;
+        Some(Clock::new(sv, t_k, offset, None, None)) // TODO: drift + drift/r
+    }
+}
 
 /// Efficient Time Interpolator
 #[derive(Debug)]

@@ -1,8 +1,8 @@
 pub mod position;
 pub mod time;
 
-pub use position::PositionInterpolator;
-pub use time::TimeInterpolator;
+pub use position::OrbitInterpolator;
+pub use time::ClockInterpolator;
 
 use hifitime::{Duration, Epoch};
 use log::debug;

@@ -1,6 +1,42 @@
-use crate::interp::Interpolator;
+use gnss::prelude::SV;
 use hifitime::{Duration, Epoch};
 use log::debug;
+use std::collections::HashMap;
+
+use crate::{interp::Interpolator, orbit::Orbit, prelude::AprioriPosition};
+
+#[derive(Debug)]
+pub struct OrbitInterpolator {
+    order: usize,
+    pub interpolators: HashMap<SV, PositionInterpolator>,
+}
+
+impl OrbitInterpolator {
+    pub fn malloc(order: usize, size: usize) -> Self {
+        Self {
+            order,
+            interpolators: HashMap::<SV, PositionInterpolator>::with_capacity(size),
+        }
+    }
+    pub fn new_orbit(&mut self, orb: Orbit) {
+        if let Some(interp) = self.interpolators.get_mut(&orb.sv) {
+            interp.push((orb.epoch, (orb.position.0, orb.position.1, orb.position.2)));
+        } else {
+            let mut interp = PositionInterpolator::new(self.order);
+            interp.push((orb.epoch, (orb.position.0, orb.position.1, orb.position.2)));
+            self.interpolators.insert(orb.sv, interp);
+        }
+    }
+    pub fn interpolate(&self, sv: SV, t_k: Epoch, apriori: &AprioriPosition) -> Option<Orbit> {
+        let interp = self
+            .interpolators
+            .iter()
+            .filter_map(|(k, v)| if *k == sv { Some(v) } else { None })
+            .reduce(|k, _| k)?;
+        let pos = interp.interpolate(t_k)?;
+        Some(Orbit::position(sv, t_k, pos, apriori))
+    }
+}
 
 /// Efficient Position Interpolator
 #[derive(Debug)]
