@@ -9,7 +9,7 @@ mod apriori;
 mod bias;
 mod cfg;
 mod clock;
-pub(crate) mod interp;
+mod interp;
 mod observation;
 mod orbit;
 mod solutions;

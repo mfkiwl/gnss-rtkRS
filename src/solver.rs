@@ -303,7 +303,7 @@ impl Solver {
                     if self.signals.iter().map(|obs| obs.epoch).unique().count() > 1
                     // next Epoch is starting: we'll drop 1st SV..
                     {
-                        // simple logic, but 1st SV of each Signal observation Epoch is lost..
+                        // simple logic, but 1st SV of each observation Epoch is lost..
                         self.signals.pop(); //drop
 
                         let samp_t = self

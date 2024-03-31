@@ -1,4 +1,3 @@
-use map_3d::rad2deg;
 use thiserror::Error;
 
 use nyx::{cosmic::Orbit as NyxOrbit, md::prelude::Frame};
@@ -6,43 +5,17 @@ use nyx::{cosmic::Orbit as NyxOrbit, md::prelude::Frame};
 use crate::prelude::AprioriPosition;
 use gnss::prelude::{Constellation, SV};
 use hifitime::{Duration, Epoch, TimeScale, Unit, GPST_REF_EPOCH};
-use std::f64::consts::PI;
 
-/// Implement this trait to provide SV Orbital States
+/// Implement this trait to provide SV Orbital States (direct positions).
 pub trait OrbitIter {
-    /// Provide Orbital states in chronological order.
+    /// Provide Orbital positions in chronological order.
     /// In order to simplify internal logic, we will panic if Orbital states
     /// are not provided in chronological order.
     /// Unevenly spaced states (in time) will delay PVT solution production,
     /// as we maintain steady interpolation errors.
+    /// Tie this to None in case you're solely using [EphemeridesIter].
     fn next(&mut self) -> Option<Orbit>;
 }
-
-// /// Satellite Vehicle Position
-// #[derive(Copy, Clone, Debug, PartialEq)]
-// pub enum Position {
-//     /// Mass Center position, in ECEF [m]
-//     MassCenter(Vector3<f64>),
-//     /// Antenna Phase Center position, in ECEF [m]
-//     AntennaPhaseCenter(Vector3<f64>),
-// }
-//
-// impl Default for Position {
-//     fn default() -> Self {
-//         Self::AntennaPhaseCenter(Vector3::<f64>::default())
-//     }
-// }
-//
-// impl Position {
-//     /// Builds new [Position] from Mass Center (MC) position in ECEF [m]
-//     pub fn mass_center(mc: (f64, f64, f64)) -> Self {
-//         Self::MassCenter(Vector3::<f64>::new(mc.0, mc.1, mc.2))
-//     }
-//     /// Builds new [Position] from Antenna Phase Center (APC) position in ECEF [m]
-//     pub fn antenna_phase_center(apc: (f64, f64, f64)) -> Self {
-//         Self::AntennaPhaseCenter(Vector3::<f64>::new(apc.0, apc.1, apc.2))
-//     }
-// }
 
 /// Satellite Vehicle Orbital state
 #[derive(Debug, Clone)]
@@ -57,46 +30,6 @@ pub struct Orbit {
     pub(crate) azimuth: f64,
     /// Elevation angle
     pub(crate) elevation: f64,
-}
-
-/// Keplerian parameters
-pub struct Keplerian {
-    /// Semi major axis (m)
-    pub a: f64,
-    /// Eccentricity (n.a)
-    pub e: f64,
-    /// Inclination angle at reference time (semicircles)
-    pub i_0: f64,
-    /// Longitude of ascending node at reference time (semicircles)
-    pub omega_0: f64,
-    /// Mean anomaly at reference time (semicircles)
-    pub m_0: f64,
-    /// argument of perigee (semicircles)
-    pub omega: f64,
-}
-
-/// Keplerian perturbations
-pub struct Perturbations {
-    /// Mean motion difference from computed value [semicircles.s-1]
-    pub dn: f64,
-    /// Inclination rate of change [semicircles.s-1]
-    pub i_dot: f64,
-    /// Right ascension rate of change [semicircles.s^-1]
-    pub omega_dot: f64,
-    /// Amplitude of sine harmonic correction term of the argument
-    /// of latitude [rad]
-    pub cus: f64,
-    /// Amplitude of cosine harmonic correction term of the argument
-    /// of latitude [rad]
-    pub cuc: f64,
-    /// Amplitude of sine harmonic correction term of the angle of inclination [rad]
-    pub cis: f64,
-    /// Amplitude of cosine harmonic correction term of the angle of inclination [rad]
-    pub cic: f64,
-    /// Amplitude of sine harmonic correction term of the orbit radius [m]
-    pub crs: f64,
-    /// Amplitude of cosine harmonic correction term of the orbit radius [m]
-    pub crc: f64,
 }
 
 impl Orbit {
@@ -237,7 +170,7 @@ impl Orbit {
         }
     }
     /// Build Self from given position that must be expressed in ECEF [m]
-    pub fn position(
+    pub fn new(
         sv: SV,
         epoch: Epoch,
         position: (f64, f64, f64),
