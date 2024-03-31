@@ -4,9 +4,10 @@ use gnss::prelude::SV;
 use hifitime::{Epoch, Unit};
 use log::{debug, error, info, warn};
 use map_3d::deg2rad;
-use nalgebra::{DVector, Matrix3, Matrix4, Matrix4x1, MatrixXx4, Vector3};
 use std::collections::HashMap;
 use thiserror::Error;
+
+use nalgebra::{DMatrix, DVector, Matrix3, Matrix4, Matrix4x1, MatrixXx4, Vector3};
 
 use nyx::{
     cosmic::{
@@ -107,8 +108,8 @@ enum State {
     ClockInterpolation,
     /// Orbital state interpolation
     OrbitInterpolation,
-    /// Processing
-    Processing,
+    /// Navigation
+    Navigation,
     /// Solution Validation
     Validation,
 }
@@ -135,18 +136,27 @@ impl ClockInterpolator {
             self.interpolators.insert(ck.sv, interp);
         }
     }
+    pub fn interpolate(&self, sv: SV, t_k: Epoch) -> Option<Clock> {
+        let interp = self
+            .interpolators
+            .iter()
+            .filter_map(|(k, v)| if *k == sv { Some(v) } else { None })
+            .reduce(|k, _| k)?;
+        let offset = interp.interpolate(t_k)?;
+        Some(Clock::new(sv, t_k, offset, None, None)) // TODO: drift + drift/r
+    }
 }
 
 #[derive(Debug)]
 struct OrbitInterpolator {
-    size: usize,
+    order: usize,
     pub interpolators: HashMap<SV, PositionInterpolator>,
 }
 
 impl OrbitInterpolator {
-    pub fn malloc(size: usize) -> Self {
+    pub fn malloc(order: usize, size: usize) -> Self {
         Self {
-            size,
+            order,
             interpolators: HashMap::<SV, PositionInterpolator>::with_capacity(size),
         }
     }
@@ -154,7 +164,7 @@ impl OrbitInterpolator {
         if let Some(interp) = self.interpolators.get_mut(&orb.sv) {
             interp.push((orb.epoch, (orb.position.0, orb.position.1, orb.position.2)));
         } else {
-            let mut interp = PositionInterpolator::new(self.size);
+            let mut interp = PositionInterpolator::new(self.order);
             interp.push((orb.epoch, (orb.position.0, orb.position.1, orb.position.2)));
             self.interpolators.insert(orb.sv, interp);
         }
@@ -241,7 +251,7 @@ impl Solver {
 
         let interp_order = cfg.interp_order;
         if interp_order % 2 == 0 {
-            panic!("only odd interpolation orders are supported");
+            panic!("only odd interpolation orders are currently supported");
         }
 
         let min_sv_required = Self::min_sv_required(solutions_type, cfg.fixed_altitude.is_some());
@@ -257,7 +267,7 @@ impl Solver {
             state: State::default(),
             signals: Vec::<Observation>::with_capacity(64),
             clock: ClockInterpolator::malloc(128),
-            orbit: OrbitInterpolator::malloc(128),
+            orbit: OrbitInterpolator::malloc(interp_order, 128),
         }
     }
     /// Runs signal quality filter
@@ -271,15 +281,24 @@ impl Solver {
     fn signal_filter(&mut self) {
         match self.cfg.method {
             Method::SPP => {
+                /*
+                 * Retain 1 L1 PR for up to 4 SV
+                 */
                 let mut index = 0;
+                let mut sv = Vec::<SV>::new();
 
-                //TODO retain L1 here
                 //TODO propose cfg::prefered frequency
-                let freq_hz = self.signals.first().unwrap().frequency_hz;
+                let freq_hz = 1575.42E6_f64;
 
                 self.signals.retain(|sig| {
-                    index += 1;
-                    sig.frequency_hz == freq_hz && index <= self.min_sv_required
+                    let retain = sig.frequency_hz == freq_hz
+                        && index < self.min_sv_required
+                        && !sv.contains(&sig.sv);
+                    if retain {
+                        index += 1;
+                        sv.push(sig.sv);
+                    }
+                    retain
                 });
             },
         }
@@ -302,12 +321,25 @@ impl Solver {
         mut clock: CK,
         mut observation: O,
     ) -> Result<Vec<PVTSolution>, Error> {
+        let mut solutions = Vec::<PVTSolution>::new();
+
         let apriori = self.apriori.clone();
+        let apriori_ecef = apriori.ecef();
         let interp_ord = self.cfg.interp_order;
         let min_sv_required = self.min_sv_required;
 
-        let mut current_samp_t = Epoch::default();
+        // interation logic
+        let mut t_tx = Epoch::default();
+        let mut t_rx = Epoch::default();
+
+        // interpolated results
+        let mut interpolated_ck = Vec::<Clock>::with_capacity(min_sv_required);
         let mut interpolated_orb = Vec::<Orbit>::with_capacity(min_sv_required);
+
+        // matrix calc.
+        let mut y = DVector::<f64>::zeros(min_sv_required);
+        let mut g = MatrixXx4::<f64>::zeros(min_sv_required);
+        let mut w = DMatrix::<f64>::identity(min_sv_required, min_sv_required);
 
         loop {
             debug!("{} - {:?}", self.cfg.method, self.state);
@@ -330,15 +362,32 @@ impl Solver {
                     if let Some(obs) = observation.next() {
                         debug!("{:?} ({}) - new observation", obs.epoch, obs.sv);
                         self.signals.push(obs);
+                    } else {
+                        info!("{:?} - consumed all signals", t_rx);
+                        return Ok(solutions);
                     }
-                    if self
-                        .signals
-                        .iter()
-                        .map(|obs| (obs.sv, obs.epoch))
-                        .unique()
-                        .count()
-                        > min_sv_required
+                    if self.signals.iter().map(|obs| obs.epoch).unique().count() > 1
+                    // next Epoch is starting: we'll drop 1st SV..
                     {
+                        // simple logic, but 1st SV of each Signal observation Epoch is lost..
+                        self.signals.pop(); //drop
+
+                        let samp_t = self
+                            .signals
+                            .iter()
+                            .min_by(|a, b| a.epoch.cmp(&b.epoch))
+                            .unwrap()
+                            .epoch;
+
+                        if samp_t != t_rx {
+                            // moving to new Epoch
+                            t_rx = samp_t;
+                            t_tx = samp_t;
+                            interpolated_ck.clear();
+                            interpolated_orb.clear();
+                            info!("new Epoch {:?}", t_rx);
+                        }
+
                         self.state = State::SignalFilter;
                         break;
                     }
@@ -347,40 +396,97 @@ impl Solver {
                     self.signal_filter();
                     self.signal_quality_filter();
 
-                    current_samp_t = self
-                        .signals
-                        .iter()
-                        .min_by(|a, b| a.epoch.cmp(&b.epoch))
-                        .unwrap()
-                        .epoch;
-
                     let count = self.signals.len();
-
                     if count < min_sv_required {
                         warn!(
                             "{:?} - too many samples below quality criteria {}/{}",
-                            current_samp_t, count, min_sv_required
+                            t_rx, count, min_sv_required
                         );
+                        self.signals.clear();
                         self.state = State::SignalAcquisition;
                     } else {
-                        debug!(
-                            "{:?} - {} observations passed quality checks",
-                            current_samp_t, count
-                        );
+                        debug!("{:?} - {} observations passed quality checks", t_rx, count);
+
+                        self.state = State::ClockInterpolation;
+                    }
+                },
+                State::ClockInterpolation => {
+                    for sv in self.signals.iter().map(|sig| sig.sv) {
+                        if let Some(ck) = self.clock.interpolate(sv, t_rx) {
+                            debug!("{:?} interpolated {:?}", t_rx, ck);
+                            interpolated_ck.push(ck);
+                        }
+                    }
+
+                    if interpolated_ck.len() < min_sv_required {
+                        self.signals.clear();
+                        interpolated_ck.clear();
+                        interpolated_orb.clear();
+                        self.state = State::SignalAcquisition;
+                        error!("{:?} - too many interpolation failures", t_rx);
+                    } else {
+                        //TODO deviation criteria ?
                         self.state = State::OrbitInterpolation;
                     }
                 },
                 State::OrbitInterpolation => {
-                    for sv in self.signals.iter().map(|sig| sig.sv) {
-                        if let Some(orb) = self.orbit.interpolate(sv, current_samp_t, &apriori) {
-                            debug!("{:?} - interpolated {:?}", current_samp_t, orb);
+                    for (sv, pr) in self.signals.iter().map(|sig| (sig.sv, sig.value)) {
+                        if self.cfg.modeling.signal_propagation {
+                            let ts = t_rx.time_scale;
+                            let seconds_ts = t_rx.to_duration().to_seconds();
+                            let dt_tx = seconds_ts - pr / SPEED_OF_LIGHT;
+                            t_tx = Epoch::from_duration(dt_tx * Unit::Second, ts);
+
+                            if self.cfg.modeling.sv_clock_bias {}
+                            if self.cfg.modeling.sv_total_group_delay {}
+
+                            let dt = t_rx - t_tx;
+                            let dt_secs = dt.to_seconds();
+                            assert!(
+                                dt_secs.is_sign_positive(),
+                                "physical non sense: RX prior TX"
+                            );
+                            assert!(
+                                dt_secs < 0.1,
+                                "physical non sense: {:?} signal propagation is suspicious",
+                                dt
+                            );
+                            debug!("{:?} ({}) - signal travel time {}", t_rx, sv, t_rx - dt);
+                        }
+                        if let Some(mut orb) = self.orbit.interpolate(sv, t_tx, &apriori) {
+                            if self.cfg.modeling.earth_rotation {
+                                let we = Orbit::EARTH_OMEGA_E_WGS84 * (t_rx - t_tx).to_seconds();
+                                let (we_cos, we_sin) = (we.cos(), we.sin());
+                                let rot = Matrix3::<f64>::new(
+                                    we_cos, we_sin, 0.0_f64, -we_sin, we_cos, 0.0_f64, 0.0_f64,
+                                    0.0_f64, 1.0_f64,
+                                );
+
+                                let rotated = rot
+                                    * Vector3::<f64>::new(
+                                        orb.position.0,
+                                        orb.position.1,
+                                        orb.position.2,
+                                    );
+                                orb.position = (rotated[0], rotated[1], rotated[2]);
+                                //TODO: do this on velocities as well
+                            }
+
+                            if self.cfg.modeling.sv_clock_bias {
+                                //TODO: calc clock corr
+                            }
+
+                            debug!("{:?} - interpolated {:?}", t_rx, orb);
                             interpolated_orb.push(orb);
                         }
                     }
 
                     if interpolated_orb.len() < min_sv_required {
-                        error!("{:?} - too many interpolation failures", current_samp_t);
+                        self.signals.clear();
+                        interpolated_ck.clear();
+                        interpolated_orb.clear();
                         self.state = State::SignalAcquisition;
+                        error!("{:?} - too many interpolation failures", t_rx);
                     } else {
                         // attitude filter
                         if let Some(min) = self.cfg.min_elevation {
@@ -393,40 +499,97 @@ impl Solver {
                             interpolated_orb.retain(|orb| orb.azimuth < max);
                         }
                         if interpolated_orb.len() < min_sv_required {
-                            error!("{:?} - too many SV below attitude criteria", current_samp_t);
+                            self.signals.clear();
+                            interpolated_ck.clear();
+                            interpolated_orb.clear();
                             self.state = State::SignalAcquisition;
+                            error!("{:?} - too many SV below attitude criteria", t_rx);
+                        } else {
+                            self.state = State::Navigation;
                         }
-                        return Err(Error::UnfitObservations);
                     }
                 },
-                State::ClockInterpolation => {
-                    return Err(Error::UnfitObservations);
+                State::Navigation => {
+                    for ((index, orbit), signal) in
+                        interpolated_orb.iter().enumerate().zip(self.signals.iter())
+                    {
+                        assert!(orbit.sv == signal.sv, "mixed up iteration");
+
+                        let (sv_x, sv_y, sv_z) = orbit.position;
+                        let rho = ((sv_x - apriori_ecef[0]).powi(2)
+                            + (sv_y - apriori_ecef[1]).powi(2)
+                            + (sv_z - apriori_ecef[2]).powi(2))
+                        .sqrt();
+
+                        g[(index, 0)] = (apriori_ecef[0] - sv_x) / rho;
+                        g[(index, 1)] = (apriori_ecef[1] - sv_y) / rho;
+                        g[(index, 2)] = (apriori_ecef[2] - sv_z) / rho;
+                        g[(index, 3)] = 1.0_f64;
+
+                        let mut biases = 0.0_f64;
+                        if self.cfg.modeling.sv_clock_bias {
+                            // biases -= orbit.clock_corr * SPEED_OF_LIGHT;
+                        }
+
+                        /*
+                         * Possible delay compensation
+                         */
+                        if let Some(delay) = self.cfg.externalref_delay {
+                            y[index] -= delay * SPEED_OF_LIGHT;
+                        }
+
+                        //let rtm = bias::RuntimeParam {
+                        //    t,
+                        //    elevation,
+                        //    azimuth,
+                        //    apriori_geo,
+                        //    frequency,
+                        //};
+
+                        if self.cfg.modeling.tropo_delay {
+                            //let bias = TroposphericBias::model(TropoModel::Niel, &rtm);
+                            //debug!("{:?} : modeled tropo delay {:.3E}[m]", t, bias);
+                            //biases += bias;
+                            //sv_data.tropo_bias = PVTBias::modeled(bias);
+                        }
+
+                        if self.cfg.modeling.iono_delay {
+                            //if let Some(bias) = iono_bias.bias(&rtm) {
+                            //    debug!(
+                            //        "{:?} : modeled iono delay (f={:.3E}Hz) {:.3E}[m]",
+                            //        t, rtm.frequency, bias
+                            //    );
+                            //    biases += bias;
+                            //    sv_data.iono_bias = PVTBias::modeled(bias);
+                            //}
+                        }
+
+                        for delay in &self.cfg.int_delay {
+                            if delay.frequency == signal.frequency_hz {
+                                y[index] += delay.delay * SPEED_OF_LIGHT;
+                            }
+                        }
+
+                        y[index] = signal.value - rho - biases;
+                    }
+                    debug!("{:?} - G: {} Y: {}", t_rx, g, y);
+
+                    let mut pvt = match PVTSolution::new(t_rx, g.clone(), w.clone(), y.clone()) {
+                        Ok(pvt) => {
+                            debug!("{:?} - new {:?}", t_rx, pvt);
+                            solutions.push(pvt);
+                        },
+                        Err(Error::TimeIsNan) => error!("time is nan"),
+                        Err(e) => panic!("solver error {:?}", e),
+                    };
+
+                    self.signals.clear();
+                    self.state = State::SignalAcquisition;
                 },
                 _ => return Err(Error::UnfitObservations),
             }
         }
     }
-    //    let (x0, y0, z0) = (
-    //        self.apriori.ecef.x,
-    //        self.apriori.ecef.y,
-    //        self.apriori.ecef.z,
-    //    );
-
-    //    let (lat_ddeg, lon_ddeg, altitude_above_sea_m) = (
-    //        self.apriori.geodetic.x,
-    //        self.apriori.geodetic.y,
-    //        self.apriori.geodetic.z,
-    //    );
-
-    //    let method = self.cfg.method;
-    //    let modeling = self.cfg.modeling;
-    //    let solver_opts = &self.cfg.solver;
-    //    let filter = solver_opts.filter;
-    //    let interp_order = self.cfg.interp_order;
-
-    //    let _cosmic = &self.cosmic;
-    //    let _earth_frame = self.earth_frame;
-
     //    /* interpolate positions */
     //    let mut pool: Vec<Candidate> = pool
     //        .iter()
@@ -438,33 +601,6 @@ impl Solver {
     //                        (self.interpolator)(t_tx, c.sv, interp_order)
     //                    {
     //                        let mut c = c.clone();
-
-    //                        let rot = match modeling.earth_rotation {
-    //                            true => {
-    //                                const EARTH_OMEGA_E_WGS84: f64 = 7.2921151467E-5;
-    //                                let we = EARTH_OMEGA_E_WGS84 * dt_ttx;
-    //                                let (we_cos, we_sin) = (we.cos(), we.sin());
-    //                                Matrix3::<f64>::new(
-    //                                    we_cos, we_sin, 0.0_f64, -we_sin, we_cos, 0.0_f64, 0.0_f64,
-    //                                    0.0_f64, 1.0_f64,
-    //                                )
-    //                            },
-    //                            false => Matrix3::<f64>::new(
-    //                                1.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 1.0_f64, 0.0_f64, 0.0_f64,
-    //                                0.0_f64, 1.0_f64,
-    //                            ),
-    //                        };
-
-    //                        interpolated.position = InterpolatedPosition::AntennaPhaseCenter(
-    //                            rot * interpolated.position(),
-    //                        );
-
-    //                        /* determine velocity */
-    //                        if let Some((p_ttx, p_position)) = self.prev_sv_state.get(&c.sv) {
-    //                            let dt = (t_tx - *p_ttx).to_seconds();
-    //                            interpolated.velocity =
-    //                                Some((rot * interpolated.position() - rot * p_position) / dt);
-    //                        }
 
     //                        self.prev_sv_state
     //                            .insert(c.sv, (t_tx, interpolated.position()));
@@ -494,91 +630,6 @@ impl Solver {
     //                            }
     //                        }
 
-    //                        debug!(
-    //                            "{:?} ({}) : interpolated state: {:?}",
-    //                            t_tx, c.sv, interpolated.position
-    //                        );
-
-    //                        c.state = Some(interpolated);
-    //                        Some(c)
-    //                    } else {
-    //                        warn!("{:?} ({}) : interpolation failed", t_tx, c.sv);
-    //                        None
-    //                    }
-    //                },
-    //                Err(e) => {
-    //                    error!("{} - transsmision time error: {:?}", c.sv, e);
-    //                    None
-    //                },
-    //            }
-    //        })
-    //        .collect();
-
-    //    /* apply elevation filter (if any) */
-    //    if let Some(min_elev) = self.cfg.min_sv_elev {
-    //        let mut idx: usize = 0;
-    //        let mut nb_removed: usize = 0;
-    //        while idx < pool.len() {
-    //            if let Some(state) = pool[idx - nb_removed].state {
-    //                if state.elevation < min_elev {
-    //                    debug!(
-    //                        "{:?} ({}) : below elevation mask",
-    //                        pool[idx - nb_removed].t,
-    //                        pool[idx - nb_removed].sv
-    //                    );
-    //                    let _ = pool.swap_remove(idx - nb_removed);
-    //                    nb_removed += 1;
-    //                }
-    //            }
-    //            idx += 1;
-    //        }
-    //    }
-
-    //    /* remove observed signals above snr mask (if any) */
-    //    if let Some(min_snr) = self.cfg.min_snr {
-    //        let mut nb_removed: usize = 0;
-    //        for idx in 0..pool.len() {
-    //            let (init_code, init_phase) = (
-    //                pool[idx - nb_removed].code.len(),
-    //                pool[idx - nb_removed].phase.len(),
-    //            );
-    //            pool[idx - nb_removed].min_snr_mask(min_snr);
-    //            let delta_code = init_code - pool[idx - nb_removed].code.len();
-    //            let delta_phase = init_phase - pool[idx - nb_removed].phase.len();
-    //            if delta_code > 0 || delta_phase > 0 {
-    //                debug!(
-    //                    "{:?} ({}) : {} code | {} phase below snr mask",
-    //                    pool[idx - nb_removed].t,
-    //                    pool[idx - nb_removed].sv,
-    //                    delta_code,
-    //                    delta_phase
-    //                );
-    //            }
-    //            /* make sure we're still compliant */
-    //            match method {
-    //                Method::SPP => {
-    //                    if pool[idx - nb_removed].code.is_empty() {
-    //                        debug!(
-    //                            "{:?} ({}) dropped on bad snr",
-    //                            pool[idx - nb_removed].t,
-    //                            pool[idx - nb_removed].sv
-    //                        );
-    //                        let _ = pool.swap_remove(idx - nb_removed);
-    //                        nb_removed += 1;
-    //                    }
-    //                },
-    //                Method::PPP => {
-    //                    let mut drop = !pool[idx - nb_removed].dual_freq_pseudorange();
-    //                    drop |= !pool[idx - nb_removed].dual_freq_phase();
-    //                    if drop {
-    //                        let _ = pool.swap_remove(idx - nb_removed);
-    //                        nb_removed += 1;
-    //                    }
-    //                },
-    //            }
-    //        }
-    //    }
-
     //    /* apply eclipse filter (if need be) */
     //    if let Some(min_rate) = self.cfg.min_sv_sunlight_rate {
     //        let mut nb_removed: usize = 0;
@@ -601,14 +652,6 @@ impl Solver {
     //                nb_removed += 1;
     //            }
     //        }
-    //    }
-
-    //    /* make sure we still have enough SV */
-    //    let nb_candidates = pool.len();
-    //    if nb_candidates < min_required {
-    //        return Err(Error::NotEnoughFittingCandidates);
-    //    } else {
-    //        debug!("{:?}: {} elected sv", t, nb_candidates);
     //    }
 
     //    /* form matrix */

@@ -91,7 +91,8 @@ fn default_timescale() -> TimeScale {
 }
 
 fn default_interp() -> usize {
-    11
+    //11
+    3
 }
 
 fn default_max_sv() -> usize {
@@ -107,6 +108,10 @@ fn default_sv_clock() -> bool {
 }
 
 fn default_sv_tgd() -> bool {
+    true
+}
+
+fn default_signal_propagation() -> bool {
     true
 }
 
@@ -226,20 +231,31 @@ impl SolverOpts {
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Modeling {
+    /// Compensate for signal propagation time
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub signal_propagation: bool,
+    /// Compensate for embedded clock drift
     #[cfg_attr(feature = "serde", serde(default))]
     pub sv_clock_bias: bool,
+    /// Compensate for onboard group delay
     #[cfg_attr(feature = "serde", serde(default))]
     pub sv_total_group_delay: bool,
+    /// Compensate for SV mass center offset
     #[cfg_attr(feature = "serde", serde(default))]
     pub sv_apc: bool,
+    /// Compensate for relativistic effect over onboard clock frequency
     #[cfg_attr(feature = "serde", serde(default))]
     pub relativistic_clock_bias: bool,
+    /// Compensate for relativistic effect on signal travel
     #[cfg_attr(feature = "serde", serde(default))]
     pub relativistic_path_range: bool,
+    /// Compensate for Troposphere impact
     #[cfg_attr(feature = "serde", serde(default))]
     pub tropo_delay: bool,
+    /// Compensate for Ionosphere impact
     #[cfg_attr(feature = "serde", serde(default))]
     pub iono_delay: bool,
+    /// Compensate Earth rotation (Sagnac effect)
     #[cfg_attr(feature = "serde", serde(default))]
     pub earth_rotation: bool,
 }
@@ -247,12 +263,13 @@ pub struct Modeling {
 impl Default for Modeling {
     fn default() -> Self {
         Self {
-            sv_clock_bias: default_sv_clock(),
             sv_apc: default_sv_apc(),
             iono_delay: default_iono(),
             tropo_delay: default_tropo(),
-            sv_total_group_delay: default_sv_tgd(),
+            sv_clock_bias: default_sv_clock(),
             earth_rotation: default_earth_rot(),
+            sv_total_group_delay: default_sv_tgd(),
+            signal_propagation: default_signal_propagation(),
             relativistic_clock_bias: default_relativistic_clock_bias(),
             relativistic_path_range: default_relativistic_path_range(),
         }

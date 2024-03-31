@@ -5,6 +5,7 @@ use log::debug;
 /// Efficient Position Interpolator
 #[derive(Debug)]
 pub struct PositionInterpolator {
+    order: usize,
     buffer: Vec<(Epoch, (f64, f64, f64))>,
 }
 
@@ -33,26 +34,40 @@ impl Interpolator<(f64, f64, f64)> for PositionInterpolator {
         {
             Some(y_s)
         } else {
-            let before = self.buffer.iter().filter(|(t, _)| *t <= t_s).last()?;
-            let after = self
-                .buffer
-                .iter()
-                .filter(|(t, _)| *t > t_s)
-                .reduce(|k, _| k)?;
-            let (before_t, (before_x, before_y, before_z)) = before;
-            let (after_t, (after_x, after_y, after_z)) = after;
-            let dt = (*after_t - *before_t).to_seconds();
-            let mut dx = (*after_t - t_s).to_seconds() / dt * before_x;
-            let mut dy = (*after_t - t_s).to_seconds() / dt * before_y;
-            let mut dz = (*after_t - t_s).to_seconds() / dt * before_z;
-            dx += (t_s - *before_t).to_seconds() / dt * after_x;
-            dy += (t_s - *before_t).to_seconds() / dt * after_y;
-            dz += (t_s - *before_t).to_seconds() / dt * after_z;
-            Some((dx, dy, dz))
+            let mut index = 0;
+            for (idx, (t, _)) in self.buffer.iter().enumerate() {
+                if *t > t_s {
+                    break;
+                }
+                index = idx;
+            }
+            debug!("{}/{}", index, self.buffer.len());
+            if index > (self.order + 1) / 2 && index < self.buffer.len() - (self.order + 1) / 2 {
+                let offset = index - (self.order + 1) / 2;
+                let mut polynomials = (0.0_f64, 0.0_f64, 0.0_f64);
+                for i in 0..self.order + 1 {
+                    let mut li = 1.0_f64;
+                    let (t_i, (x_i, y_i, z_i)) = self.buffer[offset + i];
+                    for j in 0..self.order + 1 {
+                        let (t_j, _) = self.buffer[offset + j];
+                        if j != i {
+                            li *= (t_s - t_j).to_seconds();
+                            li /= (t_i - t_j).to_seconds();
+                        }
+                    }
+                    polynomials.0 += x_i * li;
+                    polynomials.1 += y_i * li;
+                    polynomials.2 += z_i * li;
+                }
+                Some(polynomials)
+            } else {
+                None
+            }
         }
     }
     fn new(size: usize) -> Self {
         Self {
+            order: size,
             buffer: Vec::<(Epoch, (f64, f64, f64))>::with_capacity(size),
         }
     }
@@ -67,88 +82,167 @@ mod test {
     use crate::interp::{Interpolator, PositionInterpolator};
     use hifitime::Epoch;
     use std::str::FromStr;
+    // /*
+    //  * Lagrangian interpolator theoretical limitations
+    //  */
+    // fn max_error(values: &Vec(Epoch, f64)>, epoch: Epoch, order: usize) -> f64 {
+    //     let mut q = 1.0_f64;
+    //     for (e, _) in values {
+    //         q *= (epoch - e).to_seconds();
+    //     }
+    //     let factorial: usize = (1..=order + 1).product();
+    //     q.abs() / factorial as f64 // TODO f^(n+1)[x]
+    // }
     #[test]
-    fn basic() {
-        let mut interp = PositionInterpolator::new(4);
-        for (x_k, y_k, x_s, expected) in [
-            (
-                "2020-01-01T00:00:00 UTC",
-                (1.1_f64, 1.2_f64, 1.3_f64),
-                "2020-01-01T00:00:01 UTC",
-                None,
-            ),
-            (
-                "2020-01-01T00:00:30 UTC",
-                (2.1_f64, 2.2_f64, 2.3_f64),
-                "2020-01-01T00:00:15 UTC",
-                Some((1.6_f64, 1.7_f64, 1.8_f64)),
-            ),
-        ] {
-            let x_k = Epoch::from_str(x_k).unwrap();
-            interp.fill(x_k, y_k);
-            let x_s = Epoch::from_str(x_s).unwrap();
-
-            if let Some(expected) = expected {
-                let (dx, dy, dz) = interp
-                    .interpolate(x_s)
-                    .expect(&format!("interpolation should have be feasible @{:?}", x_s));
-
-                let err = (
-                    (dx - expected.0).abs(),
-                    (dy - expected.1).abs(),
-                    (dz - expected.2).abs(),
-                );
-
-                assert!(err.0 < 1.0E-6, "x(err) too large {}@{:?}", err.0, x_s);
-                assert!(err.1 < 1.0E-6, "y(err) too large {}@{:?}", err.1, x_s);
-                assert!(err.2 < 1.0E-6, "z(err) too large {}@{:?}", err.2, x_s);
-            } else {
-                assert!(
-                    interp.interpolate(x_s).is_none(),
-                    "unexpected interp results @{:?}",
-                    x_s
-                );
+    fn advanced() {
+        for (order, max_err) in [(7, 1E-1_f64), (9, 1.0E-2_f64), (11, 0.5E-3_f64)] {
+            let mut interp = PositionInterpolator::new(order);
+            for (t_k, x_k, y_k, z_k) in [
+                (
+                    "2020-06-25T00:00:00 UTC",
+                    -11562.163582,
+                    14053.114306,
+                    23345.128269,
+                ),
+                (
+                    "2020-06-25T00:15:00 UTC",
+                    -13618.625154,
+                    13865.251337,
+                    22325.739925,
+                ),
+                (
+                    "2020-06-25T00:30:00 UTC",
+                    -15578.906571,
+                    13828.422191,
+                    21028.690065,
+                ),
+                (
+                    "2020-06-25T00:45:00 UTC",
+                    -17408.137167,
+                    13927.983030,
+                    19470.096085,
+                ),
+                (
+                    "2020-06-25T01:00:00 UTC",
+                    -19074.795786,
+                    14143.814957,
+                    17669.329791,
+                ),
+                (
+                    "2020-06-25T01:15:00 UTC",
+                    -20551.644094,
+                    14450.989573,
+                    15648.777437,
+                ),
+                (
+                    "2020-06-25T01:30:00 UTC",
+                    -21816.527671,
+                    14820.587810,
+                    13433.562098,
+                ),
+                (
+                    "2020-06-25T01:45:00 UTC",
+                    -22853.019836,
+                    15220.646336,
+                    11051.231754,
+                ),
+                (
+                    "2020-06-25T02:00:00 UTC",
+                    -23650.888045,
+                    15617.201843,
+                    8531.416907,
+                ),
+                (
+                    "2020-06-25T02:15:00 UTC",
+                    -24206.368268,
+                    15975.400418,
+                    5905.461978,
+                ),
+                (
+                    "2020-06-25T02:30:00 UTC",
+                    -24522.238746,
+                    16260.637103,
+                    3206.035064,
+                ),
+                (
+                    "2020-06-25T02:45:00 UTC",
+                    -24607.690837,
+                    16439.689804,
+                    466.720941,
+                ),
+                (
+                    "2020-06-25T03:00:00 UTC",
+                    -24478.001028,
+                    16481.811839,
+                    -2278.397553,
+                ),
+                (
+                    "2020-06-25T03:15:00 UTC",
+                    -24154.014466,
+                    16359.748711,
+                    -4995.164479,
+                ),
+                (
+                    "2020-06-25T03:30:00 UTC",
+                    -23661.456259,
+                    16050.647064,
+                    -7649.776712,
+                ),
+                (
+                    "2020-06-25T03:45:00 UTC",
+                    -23030.092267,
+                    15536.827161,
+                    -10209.205433,
+                ),
+                (
+                    "2020-06-25T04:00:00 UTC",
+                    -22292.765788,
+                    14806.394539,
+                    -12641.607839,
+                ),
+                (
+                    "2020-06-25T04:15:00 UTC",
+                    -21484.340483,
+                    13853.671544,
+                    -14916.723906,
+                ),
+            ] {
+                let t_k = Epoch::from_str(t_k).unwrap();
+                interp.fill(t_k, (x_k, y_k, z_k));
+            }
+            for (t_s, expected) in [
+                (
+                    "2020-06-25T00:00:00 UTC",
+                    Some((-11562.163582, 14053.114306, 23345.128269)),
+                ),
+                ("2020-06-25T00:00:01 UTC", None),
+                ("2020-06-25T00:00:10 UTC", None),
+                (
+                    "2020-06-25T00:15:00 UTC",
+                    Some((-13618.625154, 13865.251337, 22325.739925)),
+                ),
+                (
+                    "2020-06-25T01:59:59 UTC",
+                    Some((-23650.135944, 15616.7760377, 8534.2815443)),
+                ),
+            ] {
+                let t_s = Epoch::from_str(t_s).unwrap();
+                if let Some((x, y, z)) = expected {
+                    let (x_k, y_k, z_k) = interp
+                        .interpolate(t_s)
+                        .expect(&format!("interpolation should be feasible @{:?}", t_s));
+                    let err = ((x_k - x).abs(), (y_k - y).abs(), (z_k - z).abs());
+                    assert!(err.0 < max_err, "x(err) too large @{:?}", t_s);
+                    assert!(err.1 < max_err, "z(err) too large @{:?}", t_s);
+                    assert!(err.2 < max_err, "y(err) too large @{:?}", t_s);
+                } else {
+                    assert!(
+                        interp.interpolate(t_s).is_none(),
+                        "unexpected interpolation results @{:?}",
+                        t_s
+                    );
+                }
             }
         }
     }
-    //#[test]
-    //fn advanced() {
-    //    let mut interp = PositionInterpolator::new(3);
-    //    for (x_k, y_k) in [
-    //        ("2019-01-08T00:00:00 UTC", 0.391711350090E-04),
-    //        ("2019-01-08T00:00:30 UTC", 0.391710317949E-04),
-    //        ("2019-01-08T00:01:00 UTC", 0.391708385767E-04),
-    //        ("2019-01-08T00:01:30 UTC", 0.391709678221E-04),
-    //        ("2019-01-08T00:02:00 UTC", 0.391708653726E-04),
-    //        ("2019-01-08T00:02:00 UTC", 0.391708653726E-04),
-    //        ("2019-01-08T00:02:30 UTC", 0.391709273510E-04),
-    //        ("2019-01-08T00:03:00 UTC", 0.391708515569E-04),
-    //        ("2019-01-08T00:03:30 UTC", 0.391706625209E-04),
-    //    ] {
-    //        let x_k = Epoch::from_str(x_k).unwrap();
-    //        interp.fill(x_k, y_k);
-    //    }
-    //    for (x_s, y_s) in [
-    //        ("2019-01-08T00:03:30 UTC", 0.391706625209E-04),
-    //        (
-    //            "2019-01-08T00:01:33 UTC",
-    //            27.0 / 30.0 * 0.391709678221E-04 + 3.0 / 30.0 * 0.391708653726E-04,
-    //        ),
-    //        (
-    //            "2019-01-08T00:01:44 UTC",
-    //            16.0 / 30.0 * 0.391709678221E-04 + 14.0 / 30.0 * 0.391708653726E-04,
-    //        ),
-    //        (
-    //            "2019-01-08T00:01:57 UTC",
-    //            3.0 / 30.0 * 0.391709678221E-04 + 27.0 / 30.0 * 0.391708653726E-04,
-    //        ),
-    //    ] {
-    //        let x_s = Epoch::from_str(x_s).unwrap();
-    //        let y = interp.interpolate(x_s).expect(&format!(
-    //            "interpolation should have been feasible @{:?}",
-    //            x_s
-    //        ));
-    //        assert_eq!(y, y_s, "wrong interpolation results @{:?}", x_s);
-    //    }
-    //}
 }

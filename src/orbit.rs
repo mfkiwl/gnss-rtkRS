@@ -100,6 +100,11 @@ pub struct Perturbations {
 }
 
 impl Orbit {
+    /// Eearth mass * Gravitationnal field constant [m^3/s^2]
+    pub(crate) const EARTH_GM_CONSTANT: f64 = 3.986004418E14_f64;
+    /// Earth rotation rate in WGS84 frame [rad]
+    pub(crate) const EARTH_OMEGA_E_WGS84: f64 = 7.2921151467E-5;
+
     /// Computes Elevation and Azimuth angles between given position
     /// in the Sky and apriori position on ground.
     fn elevation_azimuth(position: (f64, f64, f64), apriori: &AprioriPosition) -> (f64, f64) {
@@ -163,11 +168,6 @@ impl Orbit {
         perturbations: Perturbations,
         apriori: &AprioriPosition,
     ) -> Self {
-        /// Eearth mass * Gravitationnal field constant [m^3/s^2]
-        const EARTH_GM_CONSTANT: f64 = 3.986004418E14_f64;
-        /// Earth rotation rate in WGS84 frame [rad]
-        const EARTH_OMEGA_E_WGS84: f64 = 7.2921151467E-5;
-
         let ts = sv
             .timescale()
             .unwrap_or_else(|| panic!("kepler(): failed to determine timescale"));
@@ -194,7 +194,7 @@ impl Orbit {
         //    panic!("kepler(): invalid toe {:?} should be past epoch {:?}", toe, epoch);
         //}
 
-        let n0 = (EARTH_GM_CONSTANT / keplerian.a.powf(3.0)).sqrt();
+        let n0 = (Self::EARTH_GM_CONSTANT / keplerian.a.powf(3.0)).sqrt();
         let n = n0 + perturbations.dn;
         let m_k = keplerian.m_0 + n * t_k;
         let e_k = m_k + keplerian.e * m_k.sin();
@@ -214,8 +214,9 @@ impl Orbit {
             perturbations.crc * (2.0 * phi_k).cos() + perturbations.crs * (2.0 * phi_k).sin();
         let r_k = keplerian.a * (1.0 - keplerian.e * e_k.cos()) + dr_k;
 
-        let omega_k = keplerian.omega_0 + (perturbations.omega_dot - EARTH_OMEGA_E_WGS84) * t_k
-            - EARTH_OMEGA_E_WGS84 * toe_secs;
+        let omega_k = keplerian.omega_0
+            + (perturbations.omega_dot - Self::EARTH_OMEGA_E_WGS84) * t_k
+            - Self::EARTH_OMEGA_E_WGS84 * toe_secs;
 
         let xp_k = r_k * u_k.cos();
         let yp_k = r_k * u_k.sin();
@@ -317,7 +318,7 @@ mod test {
             133.44087594021298,
             (16685968.411769923, 20728763.631397538, -1574846.006229475),
         )] {
-            let orbit = Orbit::kepler(sv, epoch, week, secs, kepler, perturb, apriori);
+            let orbit = Orbit::kepler(sv, epoch, week, secs, kepler, perturb, &apriori);
 
             assert_eq!(orbit.sv, sv);
 

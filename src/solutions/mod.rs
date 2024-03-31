@@ -120,97 +120,31 @@ impl PVTSolution {
         g: MatrixXx4<f64>,
         w: DMatrix<f64>,
         y: DVector<f64>,
-        sv: HashMap<SV, PVTSVData>,
-        filter: Filter,
-        p_state: Option<FilterState>,
-    ) -> Result<(Self, Option<FilterState>), Error> {
-        let (q, x, new_state) = match filter {
-            Filter::None => {
-                let g_prime = g.clone().transpose();
-                let q = (g_prime.clone() * g.clone())
-                    .try_inverse()
-                    .ok_or(Error::MatrixInversionError)?;
+    ) -> Result<Self, Error> {
+        let g_prime = g.clone().transpose();
+        let q = (g_prime.clone() * g.clone())
+            .try_inverse()
+            .ok_or(Error::MatrixInversionError)?;
 
-                let p = (g_prime.clone() * w.clone() * g.clone())
-                    .try_inverse()
-                    .ok_or(Error::MatrixInversionError)?;
+        let p = (g_prime.clone() * w.clone() * g.clone())
+            .try_inverse()
+            .ok_or(Error::MatrixInversionError)?;
 
-                let x = p * (g_prime.clone() * w.clone() * y);
-                (q, x, None)
-            },
-            Filter::LSQ => {
-                if let Some(FilterState::LSQState(p_state)) = p_state {
-                    let p_1 = p_state
-                        .p
-                        .try_inverse()
-                        .ok_or(Error::CovarMatrixInversionError)?;
-
-                    let g_prime = g.clone().transpose();
-                    let q = (g_prime.clone() * g.clone())
-                        .try_inverse()
-                        .ok_or(Error::MatrixInversionError)?;
-
-                    let p = g_prime.clone() * w.clone() * g.clone();
-                    let p = (p_1 + p)
-                        .try_inverse()
-                        .ok_or(Error::CovarMatrixInversionError)?;
-
-                    let x = p * (p_1 * p_state.x + (g_prime.clone() * w.clone() * y));
-                    (q, x, Some(FilterState::LSQState(LSQState { x, p })))
-                } else {
-                    let g_prime = g.clone().transpose();
-                    let q = (g_prime.clone() * g.clone())
-                        .try_inverse()
-                        .ok_or(Error::MatrixInversionError)?;
-
-                    let p = (g_prime.clone() * w.clone() * g.clone())
-                        .try_inverse()
-                        .ok_or(Error::MatrixInversionError)?;
-
-                    let x = (p * g_prime.clone()) * w.clone() * y;
-                    (q, x, Some(FilterState::LSQState(LSQState { x, p })))
-                }
-            },
-            //Filter::KF => {
-            //    panic!("kalman filter not available yet");
-            //if let Some(FilterState::KfState(p_state)) = p_state {
-            //    let g_prime = g.clone().transpose();
-            //    let q = (g_prime.clone() * g.clone())
-            //        .try_inverse()
-            //        .ok_or(Error::MatrixInversionError)?;
-
-            //    //let p = (g_prime.clone() * w.clone() * g.clone())
-            //    //    .try_inverse()
-            //    //    .ok_or(Error::MatrixInversionError)?;
-            //    //
-            //    //let x = (p * g_prime.clone()) * w.clone() * y;
-            //    //
-            //    //(q, x, Some(FilterState::KfState(KfState {
-            //    //    x,
-            //    //    p,
-            //    //})))
-            //} else {
-            //    return Err(Error::UninitializedKalmanFilter);
-            //}
-            //},
-        };
+        let x = p * (g_prime.clone() * w.clone() * y);
 
         let dt = x[3] / SPEED_OF_LIGHT;
         if dt.is_nan() {
             return Err(Error::TimeIsNan);
         }
 
-        Ok((
-            (Self {
-                epoch,
-                sv,
-                pos: Vector3::new(x[0], x[1], x[2]),
-                vel: Vector3::<f64>::default(),
-                dt,
-                q,
-            }),
-            new_state,
-        ))
+        Ok(Self {
+            epoch,
+            sv: HashMap::new(),
+            pos: Vector3::new(x[0], x[1], x[2]),
+            vel: Vector3::<f64>::default(),
+            dt,
+            q,
+        })
     }
     /// Returns list of Space Vehicles (SV) that help form this solution.
     pub fn sv(&self) -> Vec<SV> {
