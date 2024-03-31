@@ -1,25 +1,27 @@
 //! PVT solver
 
+use gnss::prelude::SV;
 use hifitime::{Epoch, Unit};
 use log::{debug, error, info, warn};
 use map_3d::deg2rad;
+use nalgebra::{DVector, Matrix3, Matrix4, Matrix4x1, MatrixXx4, Vector3};
 use std::collections::HashMap;
 use thiserror::Error;
 
-use nyx::cosmic::eclipse::{eclipse_state, EclipseState};
-use nyx::cosmic::SPEED_OF_LIGHT;
-use nyx::md::prelude::{Arc, Cosm};
-use nyx::md::prelude::{Bodies, Frame, LightTimeCalc};
-
-use gnss::prelude::SV;
-
-use nalgebra::{DVector, Matrix3, Matrix4, Matrix4x1, MatrixXx4, Vector3};
+use nyx::{
+    cosmic::{
+        eclipse::{eclipse_state, EclipseState},
+        SPEED_OF_LIGHT,
+    },
+    md::prelude::{Arc, Bodies, Cosm, Frame, LightTimeCalc},
+};
 
 use crate::{
     apriori::AprioriPosition,
     bias::{IonosphericBias, TroposphericBias},
     cfg::{Config, Filter, Method},
     clock::{Clock, ClockIter},
+    interp::{Interpolator, PositionInterpolator, TimeInterpolator},
     observation::{Observation, ObservationIter},
     orbit::{Orbit, OrbitIter},
     solutions::{PVTSVData, PVTSolution, PVTSolutionType},
@@ -92,34 +94,99 @@ pub(crate) enum FilterState {
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
 enum State {
-    /// Clock data gathering
-    #[default]
-    ClockGathering,
     /// Need carrier signal measurements
     SignalAcquisition,
     /// Signal quality filter
     SignalFilter,
+    /// Clock data gathering
+    #[default]
+    ClockGathering,
+    /// Orbital state gathering
+    OrbitGathering,
     /// SV clock interpolation
     ClockInterpolation,
+    /// Orbital state interpolation
+    OrbitInterpolation,
     /// Processing
     Processing,
+    /// Solution Validation
+    Validation,
+}
+
+#[derive(Debug)]
+struct ClockInterpolator {
+    size: usize,
+    pub interpolators: HashMap<SV, TimeInterpolator>,
+}
+
+impl ClockInterpolator {
+    pub fn malloc(size: usize) -> Self {
+        Self {
+            size,
+            interpolators: HashMap::<SV, TimeInterpolator>::with_capacity(size),
+        }
+    }
+    pub fn new_clock(&mut self, ck: Clock) {
+        if let Some(interp) = self.interpolators.get_mut(&ck.sv) {
+            interp.push((ck.epoch, ck.offset));
+        } else {
+            let mut interp = TimeInterpolator::new(self.size);
+            interp.push((ck.epoch, ck.offset));
+            self.interpolators.insert(ck.sv, interp);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OrbitInterpolator {
+    size: usize,
+    pub interpolators: HashMap<SV, PositionInterpolator>,
+}
+
+impl OrbitInterpolator {
+    pub fn malloc(size: usize) -> Self {
+        Self {
+            size,
+            interpolators: HashMap::<SV, PositionInterpolator>::with_capacity(size),
+        }
+    }
+    pub fn new_orbit(&mut self, orb: Orbit) {
+        if let Some(interp) = self.interpolators.get_mut(&orb.sv) {
+            interp.push((orb.epoch, (orb.position.0, orb.position.1, orb.position.2)));
+        } else {
+            let mut interp = PositionInterpolator::new(self.size);
+            interp.push((orb.epoch, (orb.position.0, orb.position.1, orb.position.2)));
+            self.interpolators.insert(orb.sv, interp);
+        }
+    }
+    pub fn interpolate(&self, sv: SV, t_k: Epoch, apriori: &AprioriPosition) -> Option<Orbit> {
+        let interp = self
+            .interpolators
+            .iter()
+            .filter_map(|(k, v)| if *k == sv { Some(v) } else { None })
+            .reduce(|k, _| k)?;
+        let pos = interp.interpolate(t_k)?;
+        Some(Orbit::position(sv, t_k, pos, apriori))
+    }
 }
 
 /// PVT Solver
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Solver {
     /// Solver configuration
     cfg: Config,
     /// Solver state
     state: State,
-    /// apriori position
+    /// Apriori position
     apriori: AprioriPosition,
+    /// Minimum required
+    min_sv_required: usize,
     /// Type of solutions to resolve
     solutions_type: PVTSolutionType,
-    /// Clock states buffer
-    clocks: Vec<Clock>,
-    /// Orbital states buffer
-    orbits: Vec<Orbit>,
+    /// Clock interpolator
+    clock: ClockInterpolator,
+    /// Orbit interpolator
+    orbit: OrbitInterpolator,
     /// Observations buffer
     signals: Vec<Observation>,
     /// Cosmic model
@@ -177,6 +244,8 @@ impl Solver {
             panic!("only odd interpolation orders are supported");
         }
 
+        let min_sv_required = Self::min_sv_required(solutions_type, cfg.fixed_altitude.is_some());
+
         Self {
             cfg,
             cosmic,
@@ -184,10 +253,11 @@ impl Solver {
             sun_frame,
             earth_frame,
             solutions_type,
+            min_sv_required,
             state: State::default(),
             signals: Vec::<Observation>::with_capacity(64),
-            clocks: Vec::<Clock>::with_capacity(interp_order),
-            orbits: Vec::<Orbit>::with_capacity(interp_order),
+            clock: ClockInterpolator::malloc(128),
+            orbit: OrbitInterpolator::malloc(128),
         }
     }
     /// Runs signal quality filter
@@ -197,67 +267,86 @@ impl Solver {
                 .retain(|obs| obs.snr_db.unwrap_or(-200.0) > min_snr);
         }
     }
-    /// Runs attitude filter
-    fn sv_attitude_filter(&mut self) {
-        if let Some(min_elev) = self.cfg.min_sv_elev {
-            let before = self.orbits.len();
-            self.orbits.retain(|orb| orb.elevation > min_elev);
-            let dropped = self.orbits.len() - before;
-            debug!("dropped {} states for low elevation angles", dropped);
+    /// Code filter + total candidates filter
+    fn signal_filter(&mut self) {
+        match self.cfg.method {
+            Method::SPP => {
+                let mut index = 0;
+
+                //TODO retain L1 here
+                //TODO propose cfg::prefered frequency
+                let freq_hz = self.signals.first().unwrap().frequency_hz;
+
+                self.signals.retain(|sig| {
+                    index += 1;
+                    sig.frequency_hz == freq_hz && index <= self.min_sv_required
+                });
+            },
         }
     }
-    /// Performs orbital interpolation
-    fn orbit_interpolation<O: OrbitIter>(&mut self, orbit: O) -> State {
-        State::default()
-    }
-
-    /// Performs clock interpolation
-    fn clock_interpolation<C: ClockIter>(&mut self, clock: C) -> State {
-        State::default()
-    }
-
+    // /// Runs attitude filter
+    // fn sv_attitude_filter(&mut self) {
+    //     if let Some(min_elev) = self.cfg.min_sv_elev {
+    //         let before = self.orbits.len();
+    //         self.orbits.retain(|orb| orb.elevation > min_elev);
+    //         let dropped = self.orbits.len() - before;
+    //         debug!("dropped {} states for low elevation angles", dropped);
+    //     }
+    // }
     /// Try to resolve PVTSolution by exploiting [Observation]s, [Clock] and
     /// [Orbit]al states sources. Solver's behavior highly depends on [Config] preset
     /// and the desired [PVTSolutionType].
-    pub fn resolve<O: ObservationIter, CK: ClockIter>(
+    pub fn resolve<O: ObservationIter, OR: OrbitIter, CK: ClockIter>(
         &mut self,
-        mut observation: O,
+        mut orbit: OR,
         mut clock: CK,
+        mut observation: O,
     ) -> Result<Vec<PVTSolution>, Error> {
+        let apriori = self.apriori.clone();
         let interp_ord = self.cfg.interp_order;
-
-        let min_sv_required =
-            Self::min_sv_required(self.solutions_type, self.cfg.fixed_altitude.is_some());
+        let min_sv_required = self.min_sv_required;
 
         let mut current_samp_t = Epoch::default();
-        let mut interpolated_ck = HashMap::<SV, f64>::with_capacity(min_sv_required);
+        let mut interpolated_orb = Vec::<Orbit>::with_capacity(min_sv_required);
 
         loop {
             debug!("{} - {:?}", self.cfg.method, self.state);
             match self.state {
-                State::SignalAcquisition => {
-                    /*
-                     * Gather signal observations
-                     */
-                    loop {
-                        if let Some(obs) = observation.next() {
-                            debug!("{:?} ({}) - new observation", obs.epoch, obs.sv);
-                            self.signals.push(obs);
-                        }
-                        if self
-                            .signals
-                            .iter()
-                            .map(|obs| (obs.sv, obs.epoch))
-                            .unique()
-                            .count()
-                            > min_sv_required
-                        {
-                            self.state = State::SignalFilter;
-                            break;
-                        }
+                State::ClockGathering => {
+                    while let Some(ck) = clock.next() {
+                        debug!("{:?} ({}) - new clock state", ck.epoch, ck.sv);
+                        self.clock.new_clock(ck);
+                    }
+                    self.state = State::OrbitGathering;
+                },
+                State::OrbitGathering => {
+                    while let Some(orb) = orbit.next() {
+                        debug!("{:?} ({}) - new orbital state", orb.epoch, orb.sv);
+                        self.orbit.new_orbit(orb);
+                    }
+                    self.state = State::SignalAcquisition;
+                },
+                State::SignalAcquisition => loop {
+                    if let Some(obs) = observation.next() {
+                        debug!("{:?} ({}) - new observation", obs.epoch, obs.sv);
+                        self.signals.push(obs);
+                    }
+                    if self
+                        .signals
+                        .iter()
+                        .map(|obs| (obs.sv, obs.epoch))
+                        .unique()
+                        .count()
+                        > min_sv_required
+                    {
+                        self.state = State::SignalFilter;
+                        break;
                     }
                 },
                 State::SignalFilter => {
+                    self.signal_filter();
+                    self.signal_quality_filter();
+
                     current_samp_t = self
                         .signals
                         .iter()
@@ -265,116 +354,52 @@ impl Solver {
                         .unwrap()
                         .epoch;
 
-                    self.signal_quality_filter();
+                    let count = self.signals.len();
 
-                    // TODO:
-                    // needs to be more complex for PPP
-                    let count = self
-                        .signals
-                        .iter()
-                        .filter(|obs| obs.epoch == current_samp_t)
-                        .count();
-
-                    if count >= min_sv_required {
+                    if count < min_sv_required {
+                        warn!(
+                            "{:?} - too many samples below quality criteria {}/{}",
+                            current_samp_t, count, min_sv_required
+                        );
+                        self.state = State::SignalAcquisition;
+                    } else {
                         debug!(
                             "{:?} - {} observations passed quality checks",
                             current_samp_t, count
                         );
-                        self.state = State::ClockGathering;
-                    } else {
-                        warn!(
-                            "{:?} - too many samples below quality criteria",
-                            current_samp_t
-                        );
-                        self.state = State::SignalAcquisition;
+                        self.state = State::OrbitInterpolation;
                     }
                 },
-                State::ClockGathering => {
-                    let sv_list = self
-                        .signals
-                        .iter()
-                        .map(|sig| sig.sv)
-                        .unique()
-                        .collect::<Vec<_>>();
-                    loop {
-                        if let Some(ck) = clock.next() {
-                            if sv_list.contains(&ck.sv) {
-                                debug!("{:?} ({}) - new clock state", ck.epoch, ck.sv);
-                                self.clocks.push(ck);
-                            } else {
-                                debug!("{:?} ({}) - dropped clock state", ck.epoch, ck.sv);
-                            }
-                        } else {
-                            warn!("{:?} - consumed all clock states", current_samp_t);
-                            return Err(Error::UnfitObservations);
+                State::OrbitInterpolation => {
+                    for sv in self.signals.iter().map(|sig| sig.sv) {
+                        if let Some(orb) = self.orbit.interpolate(sv, current_samp_t, &apriori) {
+                            debug!("{:?} - interpolated {:?}", current_samp_t, orb);
+                            interpolated_orb.push(orb);
                         }
-                        //TODO: should take into account the possibility
-                        //      we don't have to interpolate.. for best performances
-                        let mut ready = true;
+                    }
 
-                        for signal in &self.signals {
-                            let before_t = self
-                                .clocks
-                                .iter()
-                                .filter(|ck| ck.sv == signal.sv && ck.epoch <= current_samp_t)
-                                .count();
-                            let after_t = self
-                                .clocks
-                                .iter()
-                                .filter(|ck| ck.sv == signal.sv && ck.epoch > current_samp_t)
-                                .count();
-                            let total = before_t + after_t;
-                            if total < 3 {
-                                debug!("{:?} ({}/{})", current_samp_t, total, 3);
-                                ready = false;
-                            } else {
-                                debug!("{:?} ({}/{}) - ready", current_samp_t, total, 3);
-                            }
+                    if interpolated_orb.len() < min_sv_required {
+                        error!("{:?} - too many interpolation failures", current_samp_t);
+                        self.state = State::SignalAcquisition;
+                    } else {
+                        // attitude filter
+                        if let Some(min) = self.cfg.min_elevation {
+                            interpolated_orb.retain(|orb| orb.elevation > min);
                         }
-                        if ready {
-                            self.state = State::ClockInterpolation;
-                            break;
+                        if let Some(min) = self.cfg.min_azimuth {
+                            interpolated_orb.retain(|orb| orb.azimuth > min);
                         }
+                        if let Some(max) = self.cfg.max_azimuth {
+                            interpolated_orb.retain(|orb| orb.azimuth < max);
+                        }
+                        if interpolated_orb.len() < min_sv_required {
+                            error!("{:?} - too many SV below attitude criteria", current_samp_t);
+                            self.state = State::SignalAcquisition;
+                        }
+                        return Err(Error::UnfitObservations);
                     }
                 },
                 State::ClockInterpolation => {
-                    //TODO: should take into account the possibility
-                    //      we don't have to interpolate.. for best performances
-                    let sv = self.signals.iter().map(|sig| sig.sv).unique();
-                    for sv in sv {
-                        let before = self
-                            .clocks
-                            .iter()
-                            .filter_map(|ck| {
-                                if ck.sv == sv && ck.epoch <= current_samp_t {
-                                    Some((ck.epoch, ck.offset))
-                                } else {
-                                    None
-                                }
-                            })
-                            .last()
-                            .unwrap();
-                        let after = self
-                            .clocks
-                            .iter()
-                            .filter_map(|ck| {
-                                if ck.sv == sv && ck.epoch <= current_samp_t {
-                                    Some((ck.epoch, ck.offset))
-                                } else {
-                                    None
-                                }
-                            })
-                            .reduce(|k, _| k)
-                            .unwrap();
-
-                        let (before_t, before_bias) = before;
-                        let (after_t, after_bias) = after;
-                        let dt = (after_t - before_t).to_seconds();
-                        let mut bias = (after_t - current_samp_t).to_seconds() / dt * before_bias;
-                        bias += (current_samp_t - before_t).to_seconds() / dt * after_bias;
-                        interpolated_ck.insert(sv, bias);
-                        debug!("{:?} ({}) interpolated {} [s]", current_samp_t, sv, bias);
-                    }
                     return Err(Error::UnfitObservations);
                 },
                 _ => return Err(Error::UnfitObservations),

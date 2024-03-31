@@ -3,6 +3,7 @@ use hifitime::{Duration, Epoch};
 use log::debug;
 
 /// Efficient Position Interpolator
+#[derive(Debug)]
 pub struct PositionInterpolator {
     buffer: Vec<(Epoch, (f64, f64, f64))>,
 }

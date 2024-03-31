@@ -3,6 +3,7 @@ use hifitime::{Duration, Epoch};
 use log::debug;
 
 /// Efficient Time Interpolator
+#[derive(Debug)]
 pub struct TimeInterpolator {
     buffer: Vec<(Epoch, f64)>,
 }

@@ -1,5 +1,5 @@
-pub(crate) mod position;
-pub(crate) mod time;
+pub mod position;
+pub mod time;
 
 pub use position::PositionInterpolator;
 pub use time::TimeInterpolator;
@@ -7,7 +7,7 @@ pub use time::TimeInterpolator;
 use hifitime::{Duration, Epoch};
 use log::debug;
 
-trait Interpolator<T> {
+pub(crate) trait Interpolator<T> {
     fn new(order: usize) -> Self;
     fn len(&self) -> usize;
     fn get(&self, idx: usize) -> Option<&(Epoch, T)>;

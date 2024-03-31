@@ -24,18 +24,18 @@ pub enum Method {
     /// Combine this to advanced configurations and high quality data, you may obtain metric precision.
     #[default]
     SPP,
-    /// Code Based Precise Point Positioning (PPP).
-    /// Uses Pseudo Range code observations in dual frequency cross mixing.
-    /// There is no point providing Ionosphere Model with this method.
-    /// Combine this to advanced configurations and high quality data, you may obtain sub metric precision.
-    PPP,
+    // /// Code Based Precise Point Positioning (PPP).
+    // /// Uses Pseudo Range code observations in dual frequency cross mixing.
+    // /// There is no point providing Ionosphere Model with this method.
+    // /// Combine this to advanced configurations and high quality data, you may obtain sub metric precision.
+    // PPP,
 }
 
 impl std::fmt::Display for Method {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::SPP => write!(fmt, "SPP"),
-            Self::PPP => write!(fmt, "PPP"),
+            // Self::PPP => write!(fmt, "PPP"),
         }
     }
 }
@@ -309,9 +309,18 @@ pub struct Config {
     /// A value closer to 1 is a stringent criteria: eclipse must be totally exited.
     #[cfg_attr(feature = "serde", serde(default))]
     pub min_sv_sunlight_rate: Option<f64>,
-    /// Minimal elevation angle. SV below that angle will not be considered.
+    /// Minimal SV elevation: we will not consider SV below that angle.
+    /// This is a simple yet quite efficient quality criteria.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub min_sv_elev: Option<f64>,
+    pub min_elevation: Option<f64>,
+    /// Minimal SV azimuth: we will not consider SV below that angle.
+    /// Not a quality criteria but might be useful in specific applications.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub min_azimuth: Option<f64>,
+    /// Maximal SV azimuth: we will not consider SV above that angle.
+    /// Not a quality criteria but might be useful in specific applications.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub max_azimuth: Option<f64>,
     /// Minimal Observation SNR for a signal observation to be considered.
     #[cfg_attr(feature = "serde", serde(default))]
     pub min_snr: Option<f64>,
@@ -336,8 +345,10 @@ impl Config {
                 interp_order: default_interp(),
                 code_smoothing: default_smoothing(),
                 min_sv_sunlight_rate: None,
-                min_sv_elev: None, //Some(15.0), //FIXME
-                min_snr: None,     //Some(30.0), // FIXME
+                min_azimuth: None,
+                max_azimuth: None,
+                min_elevation: None, //Some(15.0), //FIXME
+                min_snr: None,       //Some(30.0), // FIXME
                 modeling: Modeling::default(),
                 max_sv: default_max_sv(),
                 int_delay: Default::default(),
@@ -350,7 +361,6 @@ impl Config {
                     filter_opts: default_filter_opts(),
                 },
             },
-            Method::PPP => panic!("not available yet"),
         }
     }
 }

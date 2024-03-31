@@ -15,7 +15,7 @@ pub trait OrbitIter {
     /// are not provided in chronological order.
     /// Unevenly spaced states (in time) will delay PVT solution production,
     /// as we maintain steady interpolation errors.
-    fn next(&self) -> Option<Orbit>;
+    fn next(&mut self) -> Option<Orbit>;
 }
 
 // /// Satellite Vehicle Position
@@ -102,7 +102,7 @@ pub struct Perturbations {
 impl Orbit {
     /// Computes Elevation and Azimuth angles between given position
     /// in the Sky and apriori position on ground.
-    fn elevation_azimuth(position: (f64, f64, f64), apriori: AprioriPosition) -> (f64, f64) {
+    fn elevation_azimuth(position: (f64, f64, f64), apriori: &AprioriPosition) -> (f64, f64) {
         let (sv_x, sv_y, sv_z) = position;
 
         let ecef = apriori.ecef();
@@ -161,7 +161,7 @@ impl Orbit {
         toe_secs: f64,
         keplerian: Keplerian,
         perturbations: Perturbations,
-        apriori: AprioriPosition,
+        apriori: &AprioriPosition,
     ) -> Self {
         /// Eearth mass * Gravitationnal field constant [m^3/s^2]
         const EARTH_GM_CONSTANT: f64 = 3.986004418E14_f64;
@@ -240,7 +240,7 @@ impl Orbit {
         sv: SV,
         epoch: Epoch,
         position: (f64, f64, f64),
-        apriori: AprioriPosition,
+        apriori: &AprioriPosition,
     ) -> Self {
         let (elevation, azimuth) = Self::elevation_azimuth(position, apriori);
         Self {
