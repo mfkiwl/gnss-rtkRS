@@ -9,6 +9,7 @@ mod apriori;
 mod bias;
 mod cfg;
 mod clock;
+mod ephemerides;
 mod interp;
 mod observation;
 mod orbit;
@@ -23,12 +24,13 @@ pub mod prelude {
     pub use crate::apriori::AprioriPosition;
     pub use crate::bias::{BdModel, IonosphericBias, KbModel, NgModel, TroposphericBias};
     pub use crate::cfg::{Config, Filter, Method};
+    pub use crate::clock::{Clock, ClockIter};
+    pub use crate::ephemerides::EphemeridesIter;
+    pub use crate::observation::{Observation, ObservationIter};
+    pub use crate::orbit::{Orbit, OrbitIter};
     pub use crate::solutions::{PVTSolution, PVTSolutionType};
     pub use crate::solver::Solver;
     // re-export
-    pub use crate::clock::{Clock, ClockIter};
-    pub use crate::observation::{Observation, ObservationIter};
-    pub use crate::orbit::{Keplerian, Orbit, OrbitIter, Perturbations};
     pub use gnss::prelude::{Constellation, SV};
     pub use hifitime::{Duration, Epoch, TimeScale};
     pub use nalgebra::Vector3;

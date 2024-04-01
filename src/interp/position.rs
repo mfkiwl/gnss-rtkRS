@@ -34,13 +34,13 @@ impl OrbitInterpolator {
             .filter_map(|(k, v)| if *k == sv { Some(v) } else { None })
             .reduce(|k, _| k)?;
         let pos = interp.interpolate(t_k)?;
-        Some(Orbit::position(sv, t_k, pos, apriori))
+        Some(Orbit::new(sv, t_k, pos, apriori))
     }
 }
 
 /// Efficient Position Interpolator
 #[derive(Debug)]
-pub struct PositionInterpolator {
+struct PositionInterpolator {
     order: usize,
     buffer: Vec<(Epoch, (f64, f64, f64))>,
 }
@@ -115,7 +115,8 @@ impl Interpolator<(f64, f64, f64)> for PositionInterpolator {
 
 #[cfg(test)]
 mod test {
-    use crate::interp::{Interpolator, PositionInterpolator};
+    use super::PositionInterpolator;
+    use crate::interp::Interpolator;
     use hifitime::Epoch;
     use std::str::FromStr;
     // /*

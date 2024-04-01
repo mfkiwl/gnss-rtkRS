@@ -40,7 +40,7 @@ impl ClockInterpolator {
 
 /// Efficient Time Interpolator
 #[derive(Debug)]
-pub struct TimeInterpolator {
+struct TimeInterpolator {
     buffer: Vec<(Epoch, f64)>,
 }
 
@@ -96,7 +96,8 @@ impl Interpolator<f64> for TimeInterpolator {
 
 #[cfg(test)]
 mod test {
-    use crate::interp::{Interpolator, TimeInterpolator};
+    use super::TimeInterpolator;
+    use crate::interp::Interpolator;
     use hifitime::Epoch;
     use std::str::FromStr;
     #[test]

@@ -22,6 +22,7 @@ use crate::{
     bias::{IonosphericBias, TroposphericBias},
     cfg::{Config, Filter, Method},
     clock::{Clock, ClockIter},
+    ephemerides::EphemeridesIter,
     interp::{ClockInterpolator, OrbitInterpolator},
     observation::{Observation, ObservationIter},
     orbit::{Orbit, OrbitIter},
@@ -99,8 +100,9 @@ enum State {
     SignalAcquisition,
     /// Signal quality filter
     SignalFilter,
-    /// Clock data gathering
     #[default]
+    EphemeridesGathering,
+    /// Clock data gathering
     ClockGathering,
     /// Orbital state gathering
     OrbitGathering,
@@ -131,6 +133,8 @@ pub struct Solver {
     clock: ClockInterpolator,
     /// Orbit interpolator
     orbit: OrbitInterpolator,
+    /// Time of issue of Ephemeris
+    toe: Vec<Epoch>,
     /// Observations buffer
     signals: Vec<Observation>,
     /// Cosmic model
@@ -199,6 +203,7 @@ impl Solver {
             solutions_type,
             min_sv_required,
             state: State::default(),
+            toe: Vec::<Epoch>::with_capacity(16),
             signals: Vec::<Observation>::with_capacity(64),
             clock: ClockInterpolator::malloc(128),
             orbit: OrbitInterpolator::malloc(interp_order, 128),
@@ -249,8 +254,9 @@ impl Solver {
     /// Try to resolve PVTSolution by exploiting [Observation]s, [Clock] and
     /// [Orbit]al states sources. Solver's behavior highly depends on [Config] preset
     /// and the desired [PVTSolutionType].
-    pub fn resolve<O: ObservationIter, OR: OrbitIter, CK: ClockIter>(
+    pub fn resolve<E: EphemeridesIter, O: ObservationIter, OR: OrbitIter, CK: ClockIter>(
         &mut self,
+        mut ephemerides: E,
         mut orbit: OR,
         mut clock: CK,
         mut observation: O,
@@ -278,6 +284,11 @@ impl Solver {
         loop {
             debug!("{} - {:?}", self.cfg.method, self.state);
             match self.state {
+                State::EphemeridesGathering => {
+                    while let Some(toe) = ephemerides.next() {
+                        self.toe.push(toe);
+                    }
+                },
                 State::ClockGathering => {
                     while let Some(ck) = clock.next() {
                         debug!("{:?} ({}) - new clock state", ck.epoch, ck.sv);
