@@ -1,13 +1,20 @@
 use crate::bias::RuntimeParam;
 use crate::prelude::TimeScale;
+use hifitime::Epoch;
 use map_3d::deg2rad;
 use std::f64::consts::PI;
 
-/// Ionospheric Components to attach
-/// any resolution attempt. Fill as much as you can.
-/// If this structure is empty, you should then provide observations
-/// on at least two carrier signals so the solver can estimate this bias.
-pub struct IonosphericBias {
+/// Ionosphere Bias source
+pub trait IonosphereBiasModelIter {
+    /// Provide Bias model(s)
+    fn next(&mut self) -> Option<IonosphereBiasModel>;
+}
+
+/// Ionosphere bias.
+#[derive(Debug, Default)]
+pub struct IonosphereBiasModel {
+    /// (Start of) Validity of model
+    pub validity: Epoch,
     /// Klobuchar Model to apply
     pub kb_model: Option<KbModel>,
     /// Nequick-G model to apply
@@ -30,22 +37,26 @@ pub struct KbModel {
 }
 
 impl KbModel {
-    pub(crate) fn bias(&self, rtm: &RuntimeParam) -> Option<f64> {
+    pub(crate) fn bias(
+        &self,
+        t: Epoch,
+        frequency: f64,
+        elevation: f64,
+        azimuth: f64,
+        lat_rad: f64,
+        lon_rad: f64,
+    ) -> Option<f64> {
         const PHI_P: f64 = 78.3;
         const R_EARTH: f64 = 6378.0;
         const LAMBDA_P: f64 = 291.0;
         const L1_F: f64 = 1575.42E6;
 
-        let (lat_ddeg, lon_ddeg, _) = rtm.apriori_geo;
-
         let fract = R_EARTH / (R_EARTH + self.h_km);
-        let (elev, azim) = (deg2rad(rtm.elevation), deg2rad(rtm.azimuth));
-        let (phi_u, lambda_u) = (deg2rad(lat_ddeg), deg2rad(lon_ddeg));
+        let (elev, azim) = (deg2rad(elevation), deg2rad(azimuth));
+        let (phi_u, lambda_u) = (lat_rad, lon_rad);
 
-        let t_gps = rtm
-            .t
-            .to_duration_in_time_scale(TimeScale::GPST)
-            .to_seconds();
+        let t_gps = t.to_duration_in_time_scale(TimeScale::GPST).to_seconds();
+
         let psi = PI / 2.0 - elev - (fract * elev.cos()).asin();
         let phi_i = (phi_u.sin() * psi.cos() + phi_u.cos() * psi.sin() * azim.cos()).asin();
         let lambda_i = lambda_u + azim.sin() * psi / phi_i.cos();
@@ -83,7 +94,7 @@ impl KbModel {
             false => f * 5.0 * 10E-9,
         };
 
-        Some(i_1 * (L1_F / rtm.frequency).powi(2))
+        Some(i_1 * (L1_F / frequency).powi(2))
     }
 }
 
@@ -95,10 +106,10 @@ pub struct NgModel {
 }
 
 impl NgModel {
-    pub(crate) fn bias(&self, _rtm: &RuntimeParam) -> Option<f64> {
+    pub(crate) fn bias(&self) -> Option<f64> {
         //let phi = deg2rad(rtm.apriori_geo.0);
         //let mu = inclination / phi.cos().sqrt();
-        None //TODO
+        panic!("We only support the Klobuchar model at the moment..");
     }
 }
 
@@ -110,27 +121,60 @@ pub struct BdModel {
 }
 
 impl BdModel {
-    pub(crate) fn bias(&self, _rtm: &RuntimeParam) -> Option<f64> {
+    pub(crate) fn bias(&self) -> Option<f64> {
         //let phi = deg2rad(rtm.apriori_geo.0);
         //let mu = inclination / phi.cos().sqrt();
-        None //TODO
+        panic!("We only support the Klobuchar model at the moment..");
     }
 }
 
-impl IonosphericBias {
-    pub(crate) fn bias(&self, rtm: &RuntimeParam) -> Option<f64> {
+impl IonosphereBiasModel {
+    /// Creates a new Klobuchar model
+    pub fn klobuchar(start: Epoch, model: KbModel) -> Self {
+        let mut s = Self::default();
+        s.validity = start;
+        s.kb_model = Some(model);
+        s
+    }
+    /// Creates a new Nequick-G model
+    pub fn nequick_g(start: Epoch, model: NgModel) -> Self {
+        let mut s = Self::default();
+        s.validity = start;
+        s.ng_model = Some(model);
+        s
+    }
+    /// Creates a new BDGIM model
+    pub fn bdgim(start: Epoch, model: BdModel) -> Self {
+        let mut s = Self::default();
+        s.validity = start;
+        s.bd_model = Some(model);
+        s
+    }
+    /// Returns bias as meters of delay
+    pub(crate) fn bias(
+        &self,
+        t: Epoch,
+        frequency: f64,
+        elevation: f64,
+        azimuth: f64,
+        lat_rad: f64,
+        lon_rad: f64,
+    ) -> Option<f64> {
         if let Some(_stec) = self.stec_meas {
             // TODO
             // let alpha = 40.3 * 10E16 / frequency / frequency;
             None
         } else if let Some(kb) = self.kb_model {
-            kb.bias(rtm)
+            kb.bias(t, frequency, elevation, azimuth, lat_rad, lon_rad)
         } else if let Some(ng) = self.ng_model {
-            ng.bias(rtm)
+            ng.bias()
         } else if let Some(bd) = self.bd_model {
-            bd.bias(rtm)
+            bd.bias()
         } else {
             None
         }
+    }
+    pub(crate) fn valid(&self, t: Epoch) -> bool {
+        self.validity <= t
     }
 }

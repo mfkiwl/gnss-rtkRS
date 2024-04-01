@@ -4,7 +4,7 @@ pub(crate) mod tropo;
 pub use tropo::{TropoModel, TroposphericBias};
 
 pub(crate) mod iono;
-pub use iono::{BdModel, IonosphericBias, KbModel, NgModel};
+pub use iono::{BdModel, IonosphereBiasModel, IonosphereBiasModelIter, KbModel, NgModel};
 
 pub(crate) struct RuntimeParam {
     pub t: Epoch,

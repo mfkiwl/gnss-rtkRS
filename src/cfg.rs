@@ -91,12 +91,7 @@ fn default_timescale() -> TimeScale {
 }
 
 fn default_interp() -> usize {
-    //11
-    3
-}
-
-fn default_max_sv() -> usize {
-    10
+    3 // FIXME: 11
 }
 
 fn default_smoothing() -> bool {
@@ -124,8 +119,7 @@ fn default_tropo() -> bool {
 }
 
 fn default_earth_rot() -> bool {
-    //true //FIXME
-    false
+    true
 }
 
 fn default_relativistic_clock_bias() -> bool {
@@ -346,10 +340,6 @@ pub struct Config {
     /// modeling
     #[cfg_attr(feature = "serde", serde(default))]
     pub modeling: Modeling,
-    /// Max. number of vehicules to consider.
-    /// The more the merrier, but it also means heavier computations
-    #[cfg_attr(feature = "serde", serde(default = "default_max_sv"))]
-    pub max_sv: usize,
 }
 
 impl Config {
@@ -369,7 +359,6 @@ impl Config {
                 min_elevation: None, //Some(15.0), //FIXME
                 min_snr: None,       //Some(30.0), // FIXME
                 modeling: Modeling::default(),
-                max_sv: default_max_sv(),
                 int_delay: Default::default(),
                 externalref_delay: Default::default(),
                 arp_enu: None,

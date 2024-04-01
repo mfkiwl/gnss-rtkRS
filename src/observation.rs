@@ -18,7 +18,7 @@ pub struct Observation {
     /// Signal sampling Epoch
     pub(crate) epoch: Epoch,
     /// carrier frequency [Hz]
-    pub(crate) frequency_hz: f64,
+    pub(crate) frequency: f64,
     /// Optional (but recommended) SNR in [dB]
     pub(crate) snr_db: Option<f64>,
 }
@@ -26,12 +26,12 @@ pub struct Observation {
 impl Observation {
     /// Builds new [Observation] of one value observed from one carrier signal
     /// of given frequency. We recommend providing the SNR estimate (in dB) if that is feasible.
-    pub fn new(sv: SV, epoch: Epoch, value: f64, frequency_hz: f64, snr_db: Option<f64>) -> Self {
+    pub fn new(sv: SV, epoch: Epoch, value: f64, frequency: f64, snr_db: Option<f64>) -> Self {
         Self {
             sv,
             epoch,
             value,
-            frequency_hz,
+            frequency,
             snr_db,
         }
     }

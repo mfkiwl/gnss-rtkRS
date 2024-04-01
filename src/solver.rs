@@ -20,7 +20,7 @@ use nyx::{
 
 use crate::{
     apriori::AprioriPosition,
-    bias::{IonosphericBias, TroposphericBias},
+    bias::{IonosphereBiasModel, IonosphereBiasModelIter, TroposphericBias},
     cfg::{Config, Filter, Method},
     clock::{Clock, ClockIter},
     ephemerides::EphemeridesIter,
@@ -107,6 +107,8 @@ enum State {
     ClockGathering,
     /// Orbital state gathering
     OrbitGathering,
+    /// [IonosphereBiasModel] gathering
+    IonoModelsGathering,
     /// SV clock interpolation
     ClockInterpolation,
     /// Orbital state interpolation
@@ -136,6 +138,8 @@ pub struct Solver {
     orbit: OrbitInterpolator,
     /// Time of issue of Ephemeris
     toe: Vec<Epoch>,
+    /// Ionosphere Bias model(s)
+    iono_models: Vec<IonosphereBiasModel>,
     /// Observations buffer
     signals: Vec<Observation>,
     /// Cosmic model
@@ -204,8 +208,9 @@ impl Solver {
             solutions_type,
             min_sv_required,
             state: State::default(),
-            toe: Vec::<Epoch>::with_capacity(16),
-            signals: Vec::<Observation>::with_capacity(64),
+            toe: Vec::with_capacity(16),
+            iono_models: Vec::with_capacity(8),
+            signals: Vec::with_capacity(64),
             clock: ClockInterpolator::malloc(128),
             orbit: OrbitInterpolator::malloc(interp_order, 128),
         }
@@ -221,6 +226,10 @@ impl Solver {
     fn find_toe(&self, t: Epoch) -> Option<&Epoch> {
         self.toe.iter().filter(|toe| **toe > t).reduce(|k, _| k)
     }
+    /// Returns [IonosphereBiasModel] currently valid
+    fn iono_bias_model(&self, t: Epoch) -> Option<&IonosphereBiasModel> {
+        self.iono_models.iter().filter(|iono| iono.valid(t)).last()
+    }
     /// Code filter + total candidates filter
     fn signal_filter(&mut self) {
         match self.cfg.method {
@@ -235,7 +244,7 @@ impl Solver {
                 let freq_hz = 1575.42E6_f64;
 
                 self.signals.retain(|sig| {
-                    let retain = sig.frequency_hz == freq_hz
+                    let retain = sig.frequency == freq_hz
                         && index < self.min_sv_required
                         && !sv.contains(&sig.sv);
                     if retain {
@@ -259,18 +268,28 @@ impl Solver {
     /// Try to resolve PVTSolution by exploiting [Observation]s, [Clock] and
     /// [Orbit]al states sources. Solver's behavior highly depends on [Config] preset
     /// and the desired [PVTSolutionType].
-    pub fn resolve<E: EphemeridesIter, O: ObservationIter, OR: OrbitIter, CK: ClockIter>(
+    pub fn resolve<
+        E: EphemeridesIter,
+        O: ObservationIter,
+        OR: OrbitIter,
+        CK: ClockIter,
+        IO: IonosphereBiasModelIter,
+    >(
         &mut self,
         mut ephemerides: E,
         mut orbit: OR,
         mut clock: CK,
         mut observation: O,
+        mut ionosphere_models: IO,
     ) -> Result<Vec<PVTSolution>, Error> {
         const WEEK_SECONDS: f64 = 604800.0;
         let mut solutions = Vec::<PVTSolution>::new();
 
         let apriori = self.apriori.clone();
         let apriori_ecef = apriori.ecef();
+        let geo0_rad = apriori.geodetic_rad();
+
+        let (lat0_rad, long0_rad) = (geo0_rad[0], geo0_rad[1]);
         let (x0, y0, z0) = (apriori_ecef[0], apriori_ecef[1], apriori_ecef[2]);
 
         let interp_ord = self.cfg.interp_order;
@@ -300,6 +319,13 @@ impl Solver {
                             "We only tolerate TOE expressed in GPST at the moment.."
                         );
                         self.toe.push(toe);
+                    }
+                    // TODO: skip on PPP
+                    self.state = State::IonoModelsGathering;
+                },
+                State::IonoModelsGathering => {
+                    while let Some(model) = ionosphere_models.next() {
+                        self.iono_models.push(model);
                     }
                     self.state = State::ClockGathering;
                 },
@@ -434,7 +460,7 @@ impl Solver {
                             }
 
                             if self.cfg.modeling.sv_total_group_delay {
-                                //TODO
+                                //TODO: tgd
                             }
 
                             let dt = t_rx - t_tx;
@@ -563,18 +589,30 @@ impl Solver {
                         }
 
                         if self.cfg.modeling.iono_delay {
-                            //if let Some(bias) = iono_bias.bias(&rtm) {
-                            //    debug!(
-                            //        "{:?} : modeled iono delay (f={:.3E}Hz) {:.3E}[m]",
-                            //        t, rtm.frequency, bias
-                            //    );
-                            //    biases += bias;
-                            //    sv_data.iono_bias = PVTBias::modeled(bias);
-                            //}
+                            //TODO: only in SPP
+                            if let Some(model) = self.iono_bias_model(t_rx) {
+                                if let Some(bias) = model.bias(
+                                    t_rx,
+                                    signal.frequency,
+                                    orbit.elevation,
+                                    orbit.azimuth,
+                                    lat0_rad,
+                                    long0_rad,
+                                ) {
+                                    debug!(
+                                        "{:?} ({}) - modeled iono delay (f={:.3E}Hz) {:.3E}[m]",
+                                        t_rx, signal.sv, signal.frequency, bias
+                                    );
+                                    biases += bias;
+                                    //sv_data.iono_bias = PVTBias::modeled(bias);
+                                }
+                            } else {
+                                warn!("{:?} ({}) - no Ionosphere model!", t_rx, signal.sv);
+                            }
                         }
 
                         for delay in &self.cfg.int_delay {
-                            if delay.frequency == signal.frequency_hz {
+                            if delay.frequency == signal.frequency {
                                 y[index] += delay.delay * SPEED_OF_LIGHT;
                             }
                         }

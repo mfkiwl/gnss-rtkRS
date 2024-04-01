@@ -22,7 +22,9 @@ pub use solver::Error;
 // prelude
 pub mod prelude {
     pub use crate::apriori::AprioriPosition;
-    pub use crate::bias::{BdModel, IonosphericBias, KbModel, NgModel, TroposphericBias};
+    pub use crate::bias::{
+        BdModel, IonosphereBiasModel, IonosphereBiasModelIter, KbModel, NgModel, TroposphericBias,
+    };
     pub use crate::cfg::{Config, Filter, Method};
     pub use crate::clock::{Clock, ClockIter};
     pub use crate::ephemerides::EphemeridesIter;
