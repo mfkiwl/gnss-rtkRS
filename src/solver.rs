@@ -20,7 +20,7 @@ use nyx::{
 
 use crate::{
     apriori::AprioriPosition,
-    bias::{IonosphereBiasModel, IonosphereBiasModelIter, TroposphericBias},
+    bias::{tropo::TroposphereModel, BiasModel, IonosphereBiasModel, IonosphereBiasModelIter},
     cfg::{Config, Filter, Method},
     clock::{Clock, ClockIter},
     ephemerides::EphemeridesIter,
@@ -256,15 +256,6 @@ impl Solver {
             },
         }
     }
-    // /// Runs attitude filter
-    // fn sv_attitude_filter(&mut self) {
-    //     if let Some(min_elev) = self.cfg.min_sv_elev {
-    //         let before = self.orbits.len();
-    //         self.orbits.retain(|orb| orb.elevation > min_elev);
-    //         let dropped = self.orbits.len() - before;
-    //         debug!("dropped {} states for low elevation angles", dropped);
-    //     }
-    // }
     /// Try to resolve PVTSolution by exploiting [Observation]s, [Clock] and
     /// [Orbit]al states sources. Solver's behavior highly depends on [Config] preset
     /// and the desired [PVTSolutionType].
@@ -289,8 +280,8 @@ impl Solver {
         let apriori_ecef = apriori.ecef();
         let geo0_rad = apriori.geodetic_rad();
 
-        let (lat0_rad, long0_rad) = (geo0_rad[0], geo0_rad[1]);
         let (x0, y0, z0) = (apriori_ecef[0], apriori_ecef[1], apriori_ecef[2]);
+        let (lat0_rad, long0_rad, alt0) = (geo0_rad[0], geo0_rad[1], geo0_rad[2]);
 
         let interp_ord = self.cfg.interp_order;
         let min_sv_required = self.min_sv_required;
@@ -573,19 +564,13 @@ impl Solver {
                             y[index] -= delay * SPEED_OF_LIGHT;
                         }
 
-                        //let rtm = bias::RuntimeParam {
-                        //    t,
-                        //    elevation,
-                        //    azimuth,
-                        //    apriori_geo,
-                        //    frequency,
-                        //};
-
                         if self.cfg.modeling.tropo_delay {
-                            //let bias = TroposphericBias::model(TropoModel::Niel, &rtm);
-                            //debug!("{:?} : modeled tropo delay {:.3E}[m]", t, bias);
-                            //biases += bias;
-                            //sv_data.tropo_bias = PVTBias::modeled(bias);
+                            let delay = TroposphereModel::Niel.bias(orbit.elevation, alt0);
+                            debug!(
+                                "{:?} ({}) - modeled tropo delay {:.3E}[m]",
+                                t_rx, signal.sv, delay
+                            );
+                            biases += delay;
                         }
 
                         if self.cfg.modeling.iono_delay {

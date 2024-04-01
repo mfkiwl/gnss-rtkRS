@@ -1,8 +1,10 @@
-use crate::bias::RuntimeParam;
-use crate::prelude::TimeScale;
-use hifitime::Epoch;
 use map_3d::deg2rad;
 use std::f64::consts::PI;
+
+use crate::{
+    bias::BiasModel,
+    prelude::{Epoch, TimeScale},
+};
 
 /// Ionosphere Bias source
 pub trait IonosphereBiasModelIter {
@@ -174,7 +176,10 @@ impl IonosphereBiasModel {
             None
         }
     }
-    pub(crate) fn valid(&self, t: Epoch) -> bool {
+}
+
+impl BiasModel for IonosphereBiasModel {
+    fn valid(&self, t: Epoch) -> bool {
         self.validity <= t
     }
 }

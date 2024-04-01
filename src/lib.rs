@@ -23,7 +23,7 @@ pub use solver::Error;
 pub mod prelude {
     pub use crate::apriori::AprioriPosition;
     pub use crate::bias::{
-        BdModel, IonosphereBiasModel, IonosphereBiasModelIter, KbModel, NgModel, TroposphericBias,
+        BdModel, IonosphereBiasModel, IonosphereBiasModelIter, KbModel, NgModel,
     };
     pub use crate::cfg::{Config, Filter, Method};
     pub use crate::clock::{Clock, ClockIter};

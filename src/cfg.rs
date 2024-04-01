@@ -9,7 +9,7 @@ use nalgebra::DMatrix;
 /// Configuration Error
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("unknown tropo model")]
+    #[error("invalid/unknown troposphere model")]
     UnknownTropoModel(String),
 }
 
@@ -356,8 +356,8 @@ impl Config {
                 min_sv_sunlight_rate: None,
                 min_azimuth: None,
                 max_azimuth: None,
-                min_elevation: None, //Some(15.0), //FIXME
-                min_snr: None,       //Some(30.0), // FIXME
+                min_elevation: None, //Some(15.0), //FIXME: min_elevation
+                min_snr: None,       //Some(30.0), // FIXME: min_snr
                 modeling: Modeling::default(),
                 int_delay: Default::default(),
                 externalref_delay: Default::default(),
