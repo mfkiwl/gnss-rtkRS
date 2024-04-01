@@ -78,7 +78,7 @@ impl Interpolator<(f64, f64, f64)> for PositionInterpolator {
                 index = idx;
             }
             debug!("{}/{}", index, self.buffer.len());
-            if index > (self.order + 1) / 2 && index < self.buffer.len() - (self.order + 1) / 2 {
+            if index > self.order / 2 && index < self.buffer.len() - (self.order + 1) / 2 {
                 let offset = index - (self.order + 1) / 2;
                 let mut polynomials = (0.0_f64, 0.0_f64, 0.0_f64);
                 for i in 0..self.order + 1 {

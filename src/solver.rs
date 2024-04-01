@@ -1,11 +1,12 @@
 //! PVT solver
 
-use gnss::prelude::SV;
-use hifitime::{Epoch, Unit};
 use log::{debug, error, info, warn};
 use map_3d::deg2rad;
 use std::collections::HashMap;
 use thiserror::Error;
+
+use gnss::prelude::{Constellation, SV};
+use hifitime::{Duration, Epoch, TimeScale, Unit};
 
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix4, Matrix4x1, MatrixXx4, Vector3};
 
@@ -216,6 +217,10 @@ impl Solver {
                 .retain(|obs| obs.snr_db.unwrap_or(-200.0) > min_snr);
         }
     }
+    /// Returns TOE
+    fn find_toe(&self, t: Epoch) -> Option<&Epoch> {
+        self.toe.iter().filter(|toe| **toe > t).reduce(|k, _| k)
+    }
     /// Code filter + total candidates filter
     fn signal_filter(&mut self) {
         match self.cfg.method {
@@ -261,10 +266,13 @@ impl Solver {
         mut clock: CK,
         mut observation: O,
     ) -> Result<Vec<PVTSolution>, Error> {
+        const WEEK_SECONDS: f64 = 604800.0;
         let mut solutions = Vec::<PVTSolution>::new();
 
         let apriori = self.apriori.clone();
         let apriori_ecef = apriori.ecef();
+        let (x0, y0, z0) = (apriori_ecef[0], apriori_ecef[1], apriori_ecef[2]);
+
         let interp_ord = self.cfg.interp_order;
         let min_sv_required = self.min_sv_required;
 
@@ -275,6 +283,7 @@ impl Solver {
         // interpolated results
         let mut interpolated_ck = Vec::<Clock>::with_capacity(min_sv_required);
         let mut interpolated_orb = Vec::<Orbit>::with_capacity(min_sv_required);
+        let mut clock_corr = HashMap::<SV, f64>::with_capacity(min_sv_required);
 
         // matrix calc.
         let mut y = DVector::<f64>::zeros(min_sv_required);
@@ -286,19 +295,22 @@ impl Solver {
             match self.state {
                 State::EphemeridesGathering => {
                     while let Some(toe) = ephemerides.next() {
+                        assert!(
+                            toe.time_scale == TimeScale::GPST,
+                            "We only tolerate TOE expressed in GPST at the moment.."
+                        );
                         self.toe.push(toe);
                     }
+                    self.state = State::ClockGathering;
                 },
                 State::ClockGathering => {
                     while let Some(ck) = clock.next() {
-                        debug!("{:?} ({}) - new clock state", ck.epoch, ck.sv);
                         self.clock.new_clock(ck);
                     }
                     self.state = State::OrbitGathering;
                 },
                 State::OrbitGathering => {
                     while let Some(orb) = orbit.next() {
-                        debug!("{:?} ({}) - new orbital state", orb.epoch, orb.sv);
                         self.orbit.new_orbit(orb);
                     }
                     self.state = State::SignalAcquisition;
@@ -358,7 +370,7 @@ impl Solver {
                 State::ClockInterpolation => {
                     for sv in self.signals.iter().map(|sig| sig.sv) {
                         if let Some(ck) = self.clock.interpolate(sv, t_rx) {
-                            debug!("{:?} interpolated {:?}", t_rx, ck);
+                            debug!("{:?} - Interpolated {:?}", t_rx, ck);
                             interpolated_ck.push(ck);
                         }
                     }
@@ -382,21 +394,63 @@ impl Solver {
                             let dt_tx = seconds_ts - pr / SPEED_OF_LIGHT;
                             t_tx = Epoch::from_duration(dt_tx * Unit::Second, ts);
 
-                            if self.cfg.modeling.sv_clock_bias {}
-                            if self.cfg.modeling.sv_total_group_delay {}
+                            if self.cfg.modeling.sv_clock_bias {
+                                if let Some(toe) = self.find_toe(t_tx) {
+                                    let clock =
+                                        interpolated_ck.iter().find(|ck| ck.sv == sv).unwrap();
+
+                                    assert!(
+                                        clock.sv.constellation == Constellation::GPS,
+                                        "Can only process GPS vehicles at the moment.."
+                                    );
+
+                                    let mut dt = (t_rx - *toe).to_seconds();
+                                    if dt > WEEK_SECONDS / 2.0 {
+                                        dt -= WEEK_SECONDS;
+                                    } else if dt < -WEEK_SECONDS / 2.0 {
+                                        dt += WEEK_SECONDS;
+                                    }
+
+                                    let correction = clock.offset
+                                        + clock.drift * dt
+                                        + clock.drift_rate * dt.powi(2);
+
+                                    //TODO: il y a aussi une correction d'un effet relativiste là dessus
+
+                                    clock_corr.insert(sv, correction);
+                                    t_tx -= correction * Unit::Second;
+                                    debug!(
+                                        "{:?} ({}) - clock correction {}",
+                                        t_rx,
+                                        sv,
+                                        Duration::from_seconds(correction)
+                                    );
+                                } else {
+                                    error!(
+                                        "{:?} ({}) - undetermined ephemeris: can't proceed",
+                                        t_rx, sv
+                                    );
+                                }
+                            }
+
+                            if self.cfg.modeling.sv_total_group_delay {
+                                //TODO
+                            }
 
                             let dt = t_rx - t_tx;
                             let dt_secs = dt.to_seconds();
                             assert!(
                                 dt_secs.is_sign_positive(),
-                                "physical non sense: RX prior TX"
+                                "Physical non sense: RX {:?} prior TX {:?}",
+                                t_rx,
+                                t_tx,
                             );
                             assert!(
                                 dt_secs < 0.1,
-                                "physical non sense: {:?} signal propagation is suspicious",
+                                "Physical non sense: {:?} signal propagation looks suspicious",
                                 dt
                             );
-                            debug!("{:?} ({}) - signal travel time {}", t_rx, sv, t_rx - dt);
+                            debug!("{:?} ({}) - signal propagation {}", t_rx, sv, dt);
                         }
                         if let Some(mut orb) = self.orbit.interpolate(sv, t_tx, &apriori) {
                             if self.cfg.modeling.earth_rotation {
@@ -413,15 +467,13 @@ impl Solver {
                                         orb.position.1,
                                         orb.position.2,
                                     );
+
                                 orb.position = (rotated[0], rotated[1], rotated[2]);
-                                //TODO: do this on velocities as well
+
+                                //TODO: correct velocities as well
                             }
 
-                            if self.cfg.modeling.sv_clock_bias {
-                                //TODO: calc clock corr
-                            }
-
-                            debug!("{:?} - interpolated {:?}", t_rx, orb);
+                            debug!("{:?} - Interpolated {:?}", t_rx, orb);
                             interpolated_orb.push(orb);
                         }
                     }
@@ -455,25 +507,37 @@ impl Solver {
                     }
                 },
                 State::Navigation => {
-                    for ((index, orbit), signal) in
-                        interpolated_orb.iter().enumerate().zip(self.signals.iter())
-                    {
-                        assert!(orbit.sv == signal.sv, "mixed up iteration");
+                    for (index, signal) in self.signals.iter().enumerate() {
+                        let orbit = interpolated_orb
+                            .iter()
+                            .find(|orb| orb.sv == signal.sv)
+                            .unwrap();
+                        let clock = interpolated_ck
+                            .iter()
+                            .find(|ck| ck.sv == signal.sv)
+                            .unwrap();
 
                         let (sv_x, sv_y, sv_z) = orbit.position;
-                        let rho = ((sv_x - apriori_ecef[0]).powi(2)
-                            + (sv_y - apriori_ecef[1]).powi(2)
-                            + (sv_z - apriori_ecef[2]).powi(2))
-                        .sqrt();
+                        let rho = ((sv_x - x0).powi(2) + (sv_y - y0).powi(2) + (sv_z - z0).powi(2))
+                            .sqrt();
 
-                        g[(index, 0)] = (apriori_ecef[0] - sv_x) / rho;
-                        g[(index, 1)] = (apriori_ecef[1] - sv_y) / rho;
-                        g[(index, 2)] = (apriori_ecef[2] - sv_z) / rho;
+                        g[(index, 0)] = (x0 - sv_x) / rho;
+                        g[(index, 1)] = (y0 - sv_y) / rho;
+                        g[(index, 2)] = (z0 - sv_z) / rho;
                         g[(index, 3)] = 1.0_f64;
 
                         let mut biases = 0.0_f64;
                         if self.cfg.modeling.sv_clock_bias {
-                            // biases -= orbit.clock_corr * SPEED_OF_LIGHT;
+                            if let Some((_, clock_corr)) =
+                                clock_corr.iter().find(|(k, _)| **k == signal.sv)
+                            {
+                                biases -= clock_corr * SPEED_OF_LIGHT;
+                            } else {
+                                panic!(
+                                    "{} ({}) - undetermined ephemeris: can't proceed",
+                                    t_rx, orbit.sv
+                                );
+                            }
                         }
 
                         /*
@@ -535,20 +599,6 @@ impl Solver {
             }
         }
     }
-    //    /* interpolate positions */
-    //    let mut pool: Vec<Candidate> = pool
-    //        .iter()
-    //        .filter_map(|c| {
-    //            match c.transmission_time(&self.cfg) {
-    //                Ok((t_tx, dt_ttx)) => {
-    //                    debug!("{:?} ({}) : signal travel time: {}", t_tx, c.sv, dt_ttx);
-    //                    if let Some(mut interpolated) =
-    //                        (self.interpolator)(t_tx, c.sv, interp_order)
-    //                    {
-    //                        let mut c = c.clone();
-
-    //                        self.prev_sv_state
-    //                            .insert(c.sv, (t_tx, interpolated.position()));
 
     //                        if modeling.relativistic_clock_bias {
     //                            /*

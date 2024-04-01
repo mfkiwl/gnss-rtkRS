@@ -124,11 +124,13 @@ fn default_tropo() -> bool {
 }
 
 fn default_earth_rot() -> bool {
-    true
+    //true //FIXME
+    false
 }
 
 fn default_relativistic_clock_bias() -> bool {
-    true
+    //true //FIXME
+    false
 }
 
 fn default_relativistic_path_range() -> bool {

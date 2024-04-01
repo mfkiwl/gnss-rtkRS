@@ -46,7 +46,7 @@ impl Orbit {
         let ecef = apriori.ecef();
         let (ref_x, ref_y, ref_z) = (ecef[0], ecef[1], ecef[2]);
 
-        let geodetic_rad = apriori.geodetic();
+        let geodetic_rad = apriori.geodetic_rad();
         let (ref_lat, ref_lon) = (geodetic_rad[0], geodetic_rad[1]);
 
         // || sv - ref_pos || pseudo range
