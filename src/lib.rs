@@ -14,6 +14,7 @@ mod interp;
 mod observation;
 mod orbit;
 mod solver;
+mod sv;
 
 pub(crate) mod navigation;
 
@@ -30,6 +31,7 @@ pub mod prelude {
     pub use crate::observation::{Observation, ObservationIter};
     pub use crate::orbit::{Orbit, OrbitIter};
     pub use crate::solver::Solver;
+    pub use crate::sv::{SVInfo, SVInfoIter};
     // re-export
     pub use gnss::prelude::{Constellation, SV};
     pub use hifitime::{Duration, Epoch, TimeScale};

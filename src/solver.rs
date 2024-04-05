@@ -30,6 +30,7 @@ use crate::{
     },
     observation::{Observation, ObservationIter},
     orbit::{Orbit, OrbitIter},
+    sv::{SVInfo, SVInfoIter},
 };
 
 use itertools::Itertools;
@@ -42,6 +43,8 @@ enum State {
     SignalFilter,
     #[default]
     EphemeridesGathering,
+    /// SV Info gathering
+    SVInfoGathering,
     /// Clock data gathering
     ClockGathering,
     /// Orbital state gathering
@@ -166,10 +169,10 @@ impl Solver {
     /// Returns TOE
     fn find_toe(&self, t: Epoch) -> Option<&Epoch> {
         //self.toe.iter().filter(|toe| **toe <= t).last()
-        // TODO: only applies to GPST
+        // TODO: this value only applies to GPST
         self.toe
             .iter()
-            .filter(|toe| (**toe - t).to_seconds().abs() < 8000.0)
+            .filter(|toe| (**toe - t).to_seconds().abs() < 4000.0)
             .reduce(|k, _| k)
     }
     /// Returns [IonosphereBiasModel] currently valid
@@ -211,12 +214,14 @@ impl Solver {
         OR: OrbitIter,
         CK: ClockIter,
         IO: IonosphereBiasModelIter,
+        S: SVInfoIter,
     >(
         &mut self,
         mut ephemerides: E,
         mut orbit: OR,
         mut clock: CK,
         mut observation: O,
+        mut sv_infos: S,
         mut ionosphere_models: IO,
     ) -> Vec<PVTSolution> {
         const WEEK_SECONDS: f64 = 604800.0;
@@ -241,6 +246,7 @@ impl Solver {
         let mut navigation = Navigation::new(filter);
 
         // interpolated results
+        let mut sv_info = Vec::<SVInfo>::with_capacity(32);
         let mut interpolated_ck = Vec::<Clock>::with_capacity(min_sv_required);
         let mut interpolated_orb = Vec::<Orbit>::with_capacity(min_sv_required);
         let mut clock_corr = HashMap::<SV, f64>::with_capacity(min_sv_required);
@@ -262,6 +268,12 @@ impl Solver {
                 State::IonoModelsGathering => {
                     while let Some(model) = ionosphere_models.next() {
                         self.iono_models.push(model);
+                    }
+                    self.state = State::SVInfoGathering;
+                },
+                State::SVInfoGathering => {
+                    while let Some(sv) = sv_infos.next() {
+                        sv_info.push(sv);
                     }
                     self.state = State::ClockGathering;
                 },
@@ -373,9 +385,18 @@ impl Solver {
                             },
                         };
 
-                        // TODO: TGD
                         if self.cfg.modeling.sv_total_group_delay {
-                            //TODO: tgd
+                            if let Some(info) =
+                                sv_info.iter().filter(|info| info.sv == sv).reduce(|k, _| k)
+                            {
+                                t_tx -= info.tgd;
+                                debug!("{:?} ({}) - tgd: {}", t_rx, sv, info.tgd);
+                            } else {
+                                warn!(
+                                    "{:?} ({}) - tgd not provided, therefore not compensated!",
+                                    t_rx, sv
+                                );
+                            }
                         }
 
                         if self.cfg.modeling.sv_clock_bias {
