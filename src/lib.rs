@@ -13,11 +13,9 @@ mod ephemerides;
 mod interp;
 mod observation;
 mod orbit;
-mod solutions;
 mod solver;
 
-// pub export
-pub use solver::Error;
+pub(crate) mod navigation;
 
 // prelude
 pub mod prelude {
@@ -28,9 +26,9 @@ pub mod prelude {
     pub use crate::cfg::{Config, Filter, Method};
     pub use crate::clock::{Clock, ClockIter};
     pub use crate::ephemerides::EphemeridesIter;
+    pub use crate::navigation::solutions::{PVTSolution, PVTSolutionType};
     pub use crate::observation::{Observation, ObservationIter};
     pub use crate::orbit::{Orbit, OrbitIter};
-    pub use crate::solutions::{PVTSolution, PVTSolutionType};
     pub use crate::solver::Solver;
     // re-export
     pub use gnss::prelude::{Constellation, SV};

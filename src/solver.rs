@@ -1,5 +1,4 @@
 //! PVT solver
-
 use log::{debug, error, info, warn};
 use map_3d::deg2rad;
 use std::collections::HashMap;
@@ -7,7 +6,6 @@ use thiserror::Error;
 
 use gnss::prelude::{Constellation, SV};
 use hifitime::{Duration, Epoch, TimeScale, Unit};
-
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix4, Matrix4x1, MatrixXx4, Vector3};
 
 use nyx::{
@@ -21,79 +19,20 @@ use nyx::{
 use crate::{
     apriori::AprioriPosition,
     bias::{tropo::TroposphereModel, BiasModel, IonosphereBiasModel, IonosphereBiasModelIter},
-    cfg::{Config, Filter, Method},
+    cfg::{Config, Method},
     clock::{Clock, ClockIter},
     ephemerides::EphemeridesIter,
     interp::{ClockInterpolator, OrbitInterpolator},
+    navigation::{
+        lsq::LSQ,
+        solutions::{PVTSolution, PVTSolutionType},
+        Error, Filter, Navigation,
+    },
     observation::{Observation, ObservationIter},
     orbit::{Orbit, OrbitIter},
-    solutions::{PVTSVData, PVTSolution, PVTSolutionType},
 };
 
 use itertools::Itertools;
-
-/// Solver Error
-#[derive(Debug, Clone, Error)]
-pub enum Error {
-    #[error("observations do not match solving strategy/method")]
-    UnfitObservations,
-    #[error("need more candidates to resolve a {0} a solution")]
-    NotEnoughInputCandidates(PVTSolutionType),
-    #[error("not enough candidates fit criteria")]
-    NotEnoughFittingCandidates,
-    #[error("failed to invert navigation matrix")]
-    MatrixInversionError,
-    #[error("failed to invert covar matrix")]
-    CovarMatrixInversionError,
-    #[error("reolved NaN: invalid input matrix")]
-    TimeIsNan,
-    #[error("undefined apriori position")]
-    UndefinedAprioriPosition,
-    #[error("missing pseudo range observation")]
-    MissingPseudoRange,
-    #[error("at least one pseudo range observation is mandatory")]
-    NeedsAtLeastOnePseudoRange,
-    #[error("failed to model or measure ionospheric delay")]
-    MissingIonosphericDelayValue,
-    #[error("unresolved state: interpolation should have passed")]
-    UnresolvedState,
-    #[error("unable to form signal combination")]
-    SignalRecombination,
-    #[error("physical non sense: rx prior tx")]
-    PhysicalNonSenseRxPriorTx,
-    #[error("physical non sense: t_rx is too late")]
-    PhysicalNonSenseRxTooLate,
-    // #[error("invalidated solution: {0}")]
-    // InvalidatedSolution(SolutionInvalidation),
-    // // Kalman filter bad op: should never happen
-    // #[error("uninitialized kalman filter!")]
-    // UninitializedKalmanFilter,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct LSQState {
-    /* p matrix */
-    pub(crate) p: Matrix4<f64>,
-    /* x estimate */
-    pub(crate) x: Matrix4x1<f64>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct KfState {
-    /* p matrix */
-    pub(crate) p: Matrix4<f64>,
-    /* x estimate */
-    pub(crate) x: Matrix4x1<f64>,
-}
-
-// Filter state
-#[derive(Debug, Clone)]
-pub(crate) enum FilterState {
-    /// LSQ state
-    LSQState(LSQState),
-    /// KF state
-    KfState(KfState),
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
 enum State {
@@ -117,6 +56,8 @@ enum State {
     Navigation,
     /// Solution Validation
     Validation,
+    /// Aborting resolution
+    Abort,
 }
 
 /// PVT Solver
@@ -224,7 +165,12 @@ impl Solver {
     }
     /// Returns TOE
     fn find_toe(&self, t: Epoch) -> Option<&Epoch> {
-        self.toe.iter().filter(|toe| **toe > t).reduce(|k, _| k)
+        //self.toe.iter().filter(|toe| **toe <= t).last()
+        // TODO: only applies to GPST
+        self.toe
+            .iter()
+            .filter(|toe| (**toe - t).to_seconds().abs() < 8000.0)
+            .reduce(|k, _| k)
     }
     /// Returns [IonosphereBiasModel] currently valid
     fn iono_bias_model(&self, t: Epoch) -> Option<&IonosphereBiasModel> {
@@ -272,7 +218,7 @@ impl Solver {
         mut clock: CK,
         mut observation: O,
         mut ionosphere_models: IO,
-    ) -> Result<Vec<PVTSolution>, Error> {
+    ) -> Vec<PVTSolution> {
         const WEEK_SECONDS: f64 = 604800.0;
         let mut solutions = Vec::<PVTSolution>::new();
 
@@ -283,22 +229,21 @@ impl Solver {
         let (x0, y0, z0) = (apriori_ecef[0], apriori_ecef[1], apriori_ecef[2]);
         let (lat0_rad, long0_rad, alt0) = (geo0_rad[0], geo0_rad[1], geo0_rad[2]);
 
+        let filter = LSQ::new();
         let interp_ord = self.cfg.interp_order;
         let min_sv_required = self.min_sv_required;
 
         // interation logic
-        let mut t_tx = Epoch::default();
         let mut t_rx = Epoch::default();
+
+        let mut pvt = PVTSolution::default();
+        let mut past_pvt = Option::<PVTSolution>::None;
+        let mut navigation = Navigation::new(filter);
 
         // interpolated results
         let mut interpolated_ck = Vec::<Clock>::with_capacity(min_sv_required);
         let mut interpolated_orb = Vec::<Orbit>::with_capacity(min_sv_required);
         let mut clock_corr = HashMap::<SV, f64>::with_capacity(min_sv_required);
-
-        // matrix calc.
-        let mut y = DVector::<f64>::zeros(min_sv_required);
-        let mut g = MatrixXx4::<f64>::zeros(min_sv_required);
-        let mut w = DMatrix::<f64>::identity(min_sv_required, min_sv_required);
 
         loop {
             debug!("{} - {:?}", self.cfg.method, self.state);
@@ -338,7 +283,7 @@ impl Solver {
                         self.signals.push(obs);
                     } else {
                         info!("{:?} - consumed all signals", t_rx);
-                        return Ok(solutions);
+                        return solutions;
                     }
                     if self.signals.iter().map(|obs| obs.epoch).unique().count() > 1
                     // next Epoch is starting: we'll drop 1st SV..
@@ -356,7 +301,6 @@ impl Solver {
                         if samp_t != t_rx {
                             // moving to new Epoch
                             t_rx = samp_t;
-                            t_tx = samp_t;
                             interpolated_ck.clear();
                             interpolated_orb.clear();
                             info!("new Epoch {:?}", t_rx);
@@ -405,69 +349,72 @@ impl Solver {
                 },
                 State::OrbitInterpolation => {
                     for (sv, pr) in self.signals.iter().map(|sig| (sig.sv, sig.value)) {
-                        if self.cfg.modeling.signal_propagation {
-                            let ts = t_rx.time_scale;
-                            let seconds_ts = t_rx.to_duration().to_seconds();
-                            let dt_tx = seconds_ts - pr / SPEED_OF_LIGHT;
-                            t_tx = Epoch::from_duration(dt_tx * Unit::Second, ts);
+                        let mut t_tx = match self.cfg.modeling.signal_propagation {
+                            false => t_rx,
+                            true => {
+                                let ts = t_rx.time_scale;
+                                let seconds_ts = t_rx.to_duration().to_seconds();
+                                let dt_tx_sec = seconds_ts - pr / SPEED_OF_LIGHT;
+                                let dt_tx = Duration::from_seconds(dt_tx_sec);
+                                let t_tx = t_rx - dt_tx;
+                                assert!(
+                                    dt_tx_sec.is_sign_positive(),
+                                    "Physical non sense: RX {:?} prior TX {:?}",
+                                    t_rx,
+                                    t_tx,
+                                );
+                                assert!(
+                                    dt_tx_sec < 0.1,
+                                    "Physical non sense: {:?} signal propagation looks suspicious",
+                                    dt_tx
+                                );
+                                debug!("{:?} ({}) - signal propagation {}", t_rx, sv, dt_tx);
+                                t_tx
+                            },
+                        };
 
-                            if self.cfg.modeling.sv_clock_bias {
-                                if let Some(toe) = self.find_toe(t_tx) {
-                                    let clock =
-                                        interpolated_ck.iter().find(|ck| ck.sv == sv).unwrap();
+                        // TODO: TGD
+                        if self.cfg.modeling.sv_total_group_delay {
+                            //TODO: tgd
+                        }
 
-                                    assert!(
-                                        clock.sv.constellation == Constellation::GPS,
-                                        "Can only process GPS vehicles at the moment.."
-                                    );
+                        if self.cfg.modeling.sv_clock_bias {
+                            if let Some(toe) = self.find_toe(t_tx) {
+                                let clock = interpolated_ck.iter().find(|ck| ck.sv == sv).unwrap();
 
-                                    let mut dt = (t_rx - *toe).to_seconds();
-                                    if dt > WEEK_SECONDS / 2.0 {
-                                        dt -= WEEK_SECONDS;
-                                    } else if dt < -WEEK_SECONDS / 2.0 {
-                                        dt += WEEK_SECONDS;
-                                    }
+                                assert!(
+                                    clock.sv.constellation == Constellation::GPS,
+                                    "Can only process GPS vehicles at the moment.."
+                                );
 
-                                    let correction = clock.offset
-                                        + clock.drift * dt
-                                        + clock.drift_rate * dt.powi(2);
+                                let mut dt = (t_tx - *toe).to_seconds();
 
-                                    //TODO: il y a aussi une correction d'un effet relativiste là dessus
-
-                                    clock_corr.insert(sv, correction);
-                                    t_tx -= correction * Unit::Second;
-                                    debug!(
-                                        "{:?} ({}) - clock correction {}",
-                                        t_rx,
-                                        sv,
-                                        Duration::from_seconds(correction)
-                                    );
-                                } else {
-                                    error!(
-                                        "{:?} ({}) - undetermined ephemeris: can't proceed",
-                                        t_rx, sv
-                                    );
+                                if dt > WEEK_SECONDS / 2.0 {
+                                    dt -= WEEK_SECONDS;
+                                } else if dt < -WEEK_SECONDS / 2.0 {
+                                    dt += WEEK_SECONDS;
                                 }
-                            }
 
-                            if self.cfg.modeling.sv_total_group_delay {
-                                //TODO: tgd
-                            }
+                                let correction =
+                                    clock.offset + clock.drift * dt + clock.drift_rate * dt.powi(2);
 
-                            let dt = t_rx - t_tx;
-                            let dt_secs = dt.to_seconds();
-                            assert!(
-                                dt_secs.is_sign_positive(),
-                                "Physical non sense: RX {:?} prior TX {:?}",
-                                t_rx,
-                                t_tx,
-                            );
-                            assert!(
-                                dt_secs < 0.1,
-                                "Physical non sense: {:?} signal propagation looks suspicious",
-                                dt
-                            );
-                            debug!("{:?} ({}) - signal propagation {}", t_rx, sv, dt);
+                                //TODO: il y a aussi une correction d'un effet relativiste là dessus
+
+                                clock_corr.insert(sv, correction);
+                                t_tx -= correction * Unit::Second;
+
+                                debug!(
+                                    "{:?} ({}) - clock correction {}",
+                                    t_rx,
+                                    sv,
+                                    Duration::from_seconds(correction)
+                                );
+                            } else {
+                                error!(
+                                    "{:?} ({}) - undetermined ephemeris: can't proceed",
+                                    t_rx, sv
+                                );
+                            }
                         }
                         if let Some(mut orb) = self.orbit.interpolate(sv, t_tx, &apriori) {
                             if self.cfg.modeling.earth_rotation {
@@ -512,6 +459,30 @@ impl Solver {
                         if let Some(max) = self.cfg.max_azimuth {
                             interpolated_orb.retain(|orb| orb.azimuth < max);
                         }
+                        // TODO: eclipse filter
+                        //    /* apply eclipse filter (if need be) */
+                        //    if let Some(min_rate) = self.cfg.min_sv_sunlight_rate {
+                        //        let mut nb_removed: usize = 0;
+                        //        for idx in 0..pool.len() {
+                        //            let state = pool[idx - nb_removed].state.unwrap(); // infaillible
+                        //            let orbit = state.orbit(pool[idx - nb_removed].t, self.earth_frame);
+                        //            let state = eclipse_state(&orbit, self.sun_frame, self.earth_frame, &self.cosmic);
+                        //            let eclipsed = match state {
+                        //                EclipseState::Umbra => true,
+                        //                EclipseState::Visibilis => false,
+                        //                EclipseState::Penumbra(r) => r < min_rate,
+                        //            };
+                        //            if eclipsed {
+                        //                debug!(
+                        //                    "{:?} ({}): dropped - eclipsed by earth",
+                        //                    pool[idx - nb_removed].t,
+                        //                    pool[idx - nb_removed].sv
+                        //                );
+                        //                let _ = pool.swap_remove(idx - nb_removed);
+                        //                nb_removed += 1;
+                        //            }
+                        //        }
+                        //    }
                         if interpolated_orb.len() < min_sv_required {
                             self.signals.clear();
                             interpolated_ck.clear();
@@ -525,10 +496,13 @@ impl Solver {
                 },
                 State::Navigation => {
                     for (index, signal) in self.signals.iter().enumerate() {
+                        let mut biases = 0.0_f64;
+
                         let orbit = interpolated_orb
                             .iter()
                             .find(|orb| orb.sv == signal.sv)
                             .unwrap();
+
                         let clock = interpolated_ck
                             .iter()
                             .find(|ck| ck.sv == signal.sv)
@@ -538,22 +512,18 @@ impl Solver {
                         let rho = ((sv_x - x0).powi(2) + (sv_y - y0).powi(2) + (sv_z - z0).powi(2))
                             .sqrt();
 
-                        g[(index, 0)] = (x0 - sv_x) / rho;
-                        g[(index, 1)] = (y0 - sv_y) / rho;
-                        g[(index, 2)] = (z0 - sv_z) / rho;
-                        g[(index, 3)] = 1.0_f64;
-
-                        let mut biases = 0.0_f64;
                         if self.cfg.modeling.sv_clock_bias {
                             if let Some((_, clock_corr)) =
                                 clock_corr.iter().find(|(k, _)| **k == signal.sv)
                             {
                                 biases -= clock_corr * SPEED_OF_LIGHT;
                             } else {
-                                panic!(
-                                    "{} ({}) - undetermined ephemeris: can't proceed",
+                                error!(
+                                    "{} ({}) - undetermined ephemeris: aborting",
                                     t_rx, orbit.sv
                                 );
+                                self.state = State::Abort;
+                                break;
                             }
                         }
 
@@ -561,7 +531,7 @@ impl Solver {
                          * Possible delay compensation
                          */
                         if let Some(delay) = self.cfg.externalref_delay {
-                            y[index] -= delay * SPEED_OF_LIGHT;
+                            biases -= delay * SPEED_OF_LIGHT;
                         }
 
                         if self.cfg.modeling.tropo_delay {
@@ -598,31 +568,64 @@ impl Solver {
 
                         for delay in &self.cfg.int_delay {
                             if delay.frequency == signal.frequency {
-                                y[index] += delay.delay * SPEED_OF_LIGHT;
+                                biases += delay.delay * SPEED_OF_LIGHT;
                             }
                         }
 
-                        y[index] = signal.value - rho - biases;
+                        navigation.load(
+                            index,
+                            ((x0 - sv_x) / rho, (y0 - sv_y) / rho, (z0 - sv_z) / rho),
+                            signal.value - rho - biases,
+                        );
                     }
-                    debug!("{:?} - G: {} Y: {}", t_rx, g, y);
+                    if self.state != State::Abort {
+                        pvt = navigation.resolve(t_rx);
+                        debug!("{:?} - new {:?}", t_rx, pvt);
+                        self.state = State::Validation;
+                    }
+                },
+                State::Validation => {
+                    //if pvt.gdop() < 5.0 {
+                    if let Some(ref past_pvt) = past_pvt {
+                        let dt = (pvt.epoch - past_pvt.epoch).to_seconds();
+                        pvt.vel = Vector3::<f64>::new(
+                            (pvt.pos[0] - past_pvt.pos[0]) / dt,
+                            (pvt.pos[1] - past_pvt.pos[1]) / dt,
+                            (pvt.pos[2] - past_pvt.pos[2]) / dt,
+                        );
+                    }
+                    solutions.push(pvt.clone());
+                    past_pvt = Some(pvt.clone());
+                    navigation.confirm();
 
-                    let mut pvt = match PVTSolution::new(t_rx, g.clone(), w.clone(), y.clone()) {
-                        Ok(pvt) => {
-                            debug!("{:?} - new {:?}", t_rx, pvt);
-                            solutions.push(pvt);
-                        },
-                        Err(Error::TimeIsNan) => error!("time is nan"),
-                        Err(e) => panic!("solver error {:?}", e),
-                    };
+                    debug!("{:?} - confirmed solution", t_rx);
+                    //    /*
+                    //     * slightly rework the solution so it ""looks"" like
+                    //     * what we expect based on the defined setup.
+                    //     */
+                    //    if let Some(alt) = self.cfg.fixed_altitude {
+                    //        pvt_solution.pos.z = self.apriori.ecef.z - alt;
+                    //        pvt_solution.vel.z = 0.0_f64;
+                    //    }
 
+                    //    match solution {
+                    //        PVTSolutionType::TimeOnly => {
+                    //            pvt_solution.pos = Vector3::<f64>::default();
+                    //            pvt_solution.vel = Vector3::<f64>::default();
+                    //        },
+                    //        _ => {},
+                    //    }
+                    //}
                     self.signals.clear();
                     self.state = State::SignalAcquisition;
                 },
-                _ => return Err(Error::UnfitObservations),
+                State::Abort => {
+                    self.signals.clear();
+                    self.state = State::SignalAcquisition;
+                },
             }
         }
     }
-
     //                        if modeling.relativistic_clock_bias {
     //                            /*
     //                             * following calculations need inst. velocity
@@ -647,106 +650,4 @@ impl Solver {
     //                                c.clock_corr += bias;
     //                            }
     //                        }
-
-    //    /* apply eclipse filter (if need be) */
-    //    if let Some(min_rate) = self.cfg.min_sv_sunlight_rate {
-    //        let mut nb_removed: usize = 0;
-    //        for idx in 0..pool.len() {
-    //            let state = pool[idx - nb_removed].state.unwrap(); // infaillible
-    //            let orbit = state.orbit(pool[idx - nb_removed].t, self.earth_frame);
-    //            let state = eclipse_state(&orbit, self.sun_frame, self.earth_frame, &self.cosmic);
-    //            let eclipsed = match state {
-    //                EclipseState::Umbra => true,
-    //                EclipseState::Visibilis => false,
-    //                EclipseState::Penumbra(r) => r < min_rate,
-    //            };
-    //            if eclipsed {
-    //                debug!(
-    //                    "{:?} ({}): dropped - eclipsed by earth",
-    //                    pool[idx - nb_removed].t,
-    //                    pool[idx - nb_removed].sv
-    //                );
-    //                let _ = pool.swap_remove(idx - nb_removed);
-    //                nb_removed += 1;
-    //            }
-    //        }
-    //    }
-
-    //    /* form matrix */
-    //    let mut y = DVector::<f64>::zeros(nb_candidates);
-    //    let mut g = MatrixXx4::<f64>::zeros(nb_candidates);
-    //    let mut pvt_sv_data = HashMap::<SV, PVTSVData>::with_capacity(nb_candidates);
-
-    //    let r_sun = Self::sun_unit_vector(&self.earth_frame, &self.cosmic, t);
-
-    //    for (row_index, cd) in pool.iter().enumerate() {
-    //        if let Ok(sv_data) = cd.resolve(
-    //            t,
-    //            &self.cfg,
-    //            (x0, y0, z0),
-    //            (lat_ddeg, lon_ddeg, altitude_above_sea_m),
-    //            iono_bias,
-    //            tropo_bias,
-    //            row_index,
-    //            &mut y,
-    //            &mut g,
-    //            &r_sun,
-    //        ) {
-    //            pvt_sv_data.insert(cd.sv, sv_data);
-    //        }
-    //    }
-
-    //    let w = self.cfg.solver.weight_matrix(
-    //        nb_candidates,
-    //        pvt_sv_data
-    //            .values()
-    //            .map(|sv_data| sv_data.elevation)
-    //            .collect(),
-    //    );
-
-    //    let (mut pvt_solution, new_state) = PVTSolution::new(
-    //        g.clone(),
-    //        w.clone(),
-    //        y.clone(),
-    //        pvt_sv_data.clone(),
-    //        filter,
-    //        self.filter_state.clone(),
-    //    )?;
-
-    //    let validator = SolutionValidator::new(&self.apriori.ecef, &pool, &w, &pvt_solution);
-
-    //    let valid = validator.valid(solver_opts);
-    //    if valid.is_err() {
-    //        return Err(Error::InvalidatedSolution(valid.err().unwrap()));
-    //    }
-
-    //    if let Some((prev_t, prev_pvt)) = &self.prev_pvt {
-    //        pvt_solution.vel = (pvt_solution.pos - prev_pvt.pos) / (t - *prev_t).to_seconds();
-    //    }
-
-    //    self.prev_pvt = Some((t, pvt_solution.clone()));
-
-    //    if filter != Filter::None {
-    //        self.filter_state = new_state;
-    //    }
-
-    //    /*
-    //     * slightly rework the solution so it ""looks"" like
-    //     * what we expect based on the defined setup.
-    //     */
-    //    if let Some(alt) = self.cfg.fixed_altitude {
-    //        pvt_solution.pos.z = self.apriori.ecef.z - alt;
-    //        pvt_solution.vel.z = 0.0_f64;
-    //    }
-
-    //    match solution {
-    //        PVTSolutionType::TimeOnly => {
-    //            pvt_solution.pos = Vector3::<f64>::default();
-    //            pvt_solution.vel = Vector3::<f64>::default();
-    //        },
-    //        _ => {},
-    //    }
-
-    //    Ok((t, pvt_solution))
-    //}
 }

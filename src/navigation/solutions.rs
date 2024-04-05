@@ -1,8 +1,11 @@
 //! PVT Solutions
-use crate::prelude::{Filter, Vector3, SV};
-use crate::solver::{FilterState, LSQState};
-use crate::Error;
-use hifitime::Epoch;
+
+use crate::{
+    navigation::Error,
+    prelude::{Epoch, Vector3, SV},
+    //use crate::solver::{FilterState, LSQState};
+};
+
 use std::collections::HashMap;
 
 // pub(crate) mod validator;
@@ -94,7 +97,7 @@ pub struct PVTSVData {
 #[derive(Debug, Clone, Default)]
 // #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct PVTSolution {
-    /// Signal Sampline Epoch
+    /// Signal Sampling Epoch
     pub epoch: Epoch,
     /// Position errors (in [m] ECEF)
     pub pos: Vector3<f64>,
@@ -110,41 +113,16 @@ pub struct PVTSolution {
 }
 
 impl PVTSolution {
-    /// Builds a new PVTSolution from
-    /// "g": the navigation matrix
-    /// "w": diagonal weight matrix
-    /// "y": the navigation vector
-    /// "sv": attached SV data
-    pub(crate) fn new(
-        epoch: Epoch,
-        g: MatrixXx4<f64>,
-        w: DMatrix<f64>,
-        y: DVector<f64>,
-    ) -> Result<Self, Error> {
-        let g_prime = g.clone().transpose();
-        let q = (g_prime.clone() * g.clone())
-            .try_inverse()
-            .ok_or(Error::MatrixInversionError)?;
-
-        let p = (g_prime.clone() * w.clone() * g.clone())
-            .try_inverse()
-            .ok_or(Error::MatrixInversionError)?;
-
-        let x = p * (g_prime.clone() * w.clone() * y);
-
-        let dt = x[3] / SPEED_OF_LIGHT;
-        if dt.is_nan() {
-            return Err(Error::TimeIsNan);
-        }
-
-        Ok(Self {
-            epoch,
+    /// Creates Self
+    pub fn new(t: Epoch, pos: Vector3<f64>, vel: Vector3<f64>, time: f64, q: Matrix4<f64>) -> Self {
+        Self {
+            epoch: t,
+            pos,
+            vel,
+            dt: time,
             sv: HashMap::new(),
-            pos: Vector3::new(x[0], x[1], x[2]),
-            vel: Vector3::<f64>::default(),
-            dt,
             q,
-        })
+        }
     }
     /// Returns list of Space Vehicles (SV) that help form this solution.
     pub fn sv(&self) -> Vec<SV> {

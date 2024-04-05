@@ -78,7 +78,7 @@ impl Interpolator<(f64, f64, f64)> for PositionInterpolator {
                 index = idx;
             }
             debug!("{}/{}", index, self.buffer.len());
-            if index > self.order / 2 && index < self.buffer.len() - (self.order + 1) / 2 {
+            if index > (self.order + 1) / 2 && index < self.buffer.len() - (self.order + 1) / 2 {
                 let offset = index - (self.order + 1) / 2;
                 let mut polynomials = (0.0_f64, 0.0_f64, 0.0_f64);
                 for i in 0..self.order + 1 {
@@ -119,17 +119,6 @@ mod test {
     use crate::interp::Interpolator;
     use hifitime::Epoch;
     use std::str::FromStr;
-    // /*
-    //  * Lagrangian interpolator theoretical limitations
-    //  */
-    // fn max_error(values: &Vec(Epoch, f64)>, epoch: Epoch, order: usize) -> f64 {
-    //     let mut q = 1.0_f64;
-    //     for (e, _) in values {
-    //         q *= (epoch - e).to_seconds();
-    //     }
-    //     let factorial: usize = (1..=order + 1).product();
-    //     q.abs() / factorial as f64 // TODO f^(n+1)[x]
-    // }
     #[test]
     fn advanced() {
         for (order, max_err) in [(7, 1E-1_f64), (9, 1.0E-2_f64), (11, 0.5E-3_f64)] {
@@ -262,6 +251,10 @@ mod test {
                     "2020-06-25T01:59:59 UTC",
                     Some((-23650.135944, 15616.7760377, 8534.2815443)),
                 ),
+                (
+                    "2020-06-25T02:29:59 UTC",
+                    Some((-24522.01793, 16260.37314, 3209.06284)),
+                ),
             ] {
                 let t_s = Epoch::from_str(t_s).unwrap();
                 if let Some((x, y, z)) = expected {
@@ -269,9 +262,9 @@ mod test {
                         .interpolate(t_s)
                         .expect(&format!("interpolation should be feasible @{:?}", t_s));
                     let err = ((x_k - x).abs(), (y_k - y).abs(), (z_k - z).abs());
-                    assert!(err.0 < max_err, "x(err) too large @{:?}", t_s);
-                    assert!(err.1 < max_err, "z(err) too large @{:?}", t_s);
-                    assert!(err.2 < max_err, "y(err) too large @{:?}", t_s);
+                    assert!(err.0 < max_err, "x(err) {} too large @{:?}", x_k, t_s);
+                    assert!(err.1 < max_err, "y(err) {} too large @{:?}", y_k, t_s);
+                    assert!(err.2 < max_err, "z(err) {} too large @{:?}", z_k, t_s);
                 } else {
                     assert!(
                         interp.interpolate(t_s).is_none(),
