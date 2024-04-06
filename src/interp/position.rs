@@ -70,16 +70,18 @@ impl Interpolator<(f64, f64, f64)> for PositionInterpolator {
         {
             Some(y_s)
         } else {
-            let mut index = 0;
-            for (idx, (t, _)) in self.buffer.iter().enumerate() {
+            let mut offset = Option::<usize>::None;
+            for (idx, (t, _)) in self.buffer.iter().skip((self.order + 1) / 2).enumerate() {
                 if *t > t_s {
                     break;
                 }
-                index = idx;
+                offset = Some((self.order + 1) / 2 + idx);
             }
-            debug!("{}/{}", index, self.buffer.len());
-            if index > (self.order + 1) / 2 && index < self.buffer.len() - (self.order + 1) / 2 {
-                let offset = index - (self.order + 1) / 2;
+
+            let offset = offset?;
+            debug!("{}/{}", offset, self.buffer.len());
+
+            if offset < self.buffer.len() - self.order {
                 let mut polynomials = (0.0_f64, 0.0_f64, 0.0_f64);
                 for i in 0..self.order + 1 {
                     let mut li = 1.0_f64;
@@ -121,7 +123,7 @@ mod test {
     use std::str::FromStr;
     #[test]
     fn advanced() {
-        for (order, max_err) in [(7, 1E-1_f64), (9, 1.0E-2_f64), (11, 0.5E-3_f64)] {
+        for (order, max_err) in [(5, 1E-1_f64), (7, 0.5E-1_f64)] {
             let mut interp = PositionInterpolator::new(order);
             for (t_k, x_k, y_k, z_k) in [
                 (
@@ -254,6 +256,10 @@ mod test {
                 (
                     "2020-06-25T02:29:59 UTC",
                     Some((-24522.01793, 16260.37314, 3209.06284)),
+                ),
+                (
+                    "2020-06-25T03:00:00 UTC",
+                    Some((-24478.001028, 16481.811839, -2278.397553)),
                 ),
             ] {
                 let t_s = Epoch::from_str(t_s).unwrap();

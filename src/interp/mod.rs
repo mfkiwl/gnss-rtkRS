@@ -29,10 +29,10 @@ pub(crate) trait Interpolator<T> {
     fn fill(&mut self, x_j: Epoch, y_j: T) {
         if let Some((last, dt)) = self.dt() {
             if (x_j - last).to_seconds().is_sign_positive() {
-                if (x_j - last) > dt {
-                    debug!("buffer reset on data gap @{:?}:{}", last, x_j - last);
-                    self.clear();
-                }
+                //if (x_j - last) > dt {
+                //    debug!("buffer reset on data gap @{:?}:{}", last, x_j - last);
+                //    self.clear();
+                //}
                 self.push((x_j, y_j));
             } else {
                 panic!("samples should be provided in chronological order");

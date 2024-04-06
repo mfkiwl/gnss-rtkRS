@@ -135,11 +135,17 @@ impl Solver {
         if cfg.modeling.relativistic_path_range {
             warn!("relativistic path range modeling is not supported at the moment");
         }
+        if !cfg.modeling.signal_propagation {
+            if cfg.modeling.earth_rotation {
+                warn!("cannot compensate Earth rotation without compensating signal propagation");
+            }
+        }
 
         let interp_order = cfg.interp_order;
-        if interp_order % 2 == 0 {
-            panic!("only odd interpolation orders are currently supported");
-        }
+        assert!(
+            interp_order % 2 > 0,
+            "only odd interpolation orders are supported"
+        );
 
         let min_sv_required = Self::min_sv_required(solutions_type, cfg.fixed_altitude.is_some());
 
@@ -343,7 +349,7 @@ impl Solver {
                 State::ClockInterpolation => {
                     for sv in self.signals.iter().map(|sig| sig.sv) {
                         if let Some(ck) = self.clock.interpolate(sv, t_rx) {
-                            debug!("{:?} - Interpolated {:?}", t_rx, ck);
+                            debug!("{:?} ({}) - Interpolated {:?}", t_rx, sv, ck);
                             interpolated_ck.push(ck);
                         }
                     }
@@ -353,7 +359,7 @@ impl Solver {
                         interpolated_ck.clear();
                         interpolated_orb.clear();
                         self.state = State::SignalAcquisition;
-                        error!("{:?} - too many interpolation failures", t_rx);
+                        error!("{:?} - too many (clock) interpolation failures", t_rx);
                     } else {
                         //TODO deviation criteria ?
                         self.state = State::OrbitInterpolation;
@@ -367,20 +373,22 @@ impl Solver {
                                 let ts = t_rx.time_scale;
                                 let seconds_ts = t_rx.to_duration().to_seconds();
                                 let dt_tx_sec = seconds_ts - pr / SPEED_OF_LIGHT;
-                                let dt_tx = Duration::from_seconds(dt_tx_sec);
-                                let t_tx = t_rx - dt_tx;
+                                let t_tx =
+                                    Epoch::from_duration(dt_tx_sec * Unit::Second, TimeScale::GPST); //TODO GPST
+                                let dt = t_rx - t_tx;
+                                let dt_sec = dt.to_seconds();
                                 assert!(
-                                    dt_tx_sec.is_sign_positive(),
+                                    dt_sec.is_sign_positive(),
                                     "Physical non sense: RX {:?} prior TX {:?}",
                                     t_rx,
                                     t_tx,
                                 );
                                 assert!(
-                                    dt_tx_sec < 0.1,
-                                    "Physical non sense: {:?} signal propagation looks suspicious",
-                                    dt_tx
+                                    dt_sec < 0.1,
+                                    "Physical non sense: {} signal propagation looks suspicious",
+                                    dt
                                 );
-                                debug!("{:?} ({}) - signal propagation {}", t_rx, sv, dt_tx);
+                                debug!("{:?} ({}) - signal propagation {}", t_rx, sv, dt);
                                 t_tx
                             },
                         };
@@ -458,7 +466,7 @@ impl Solver {
                                 //TODO: correct velocities as well
                             }
 
-                            debug!("{:?} - Interpolated {:?}", t_rx, orb);
+                            debug!("{:?} ({}) - Interpolated {:?}", t_rx, sv, orb);
                             interpolated_orb.push(orb);
                         }
                     }
@@ -468,7 +476,7 @@ impl Solver {
                         interpolated_ck.clear();
                         interpolated_orb.clear();
                         self.state = State::SignalAcquisition;
-                        error!("{:?} - too many interpolation failures", t_rx);
+                        error!("{:?} - too many (orbit) interpolation failures", t_rx);
                     } else {
                         // attitude filter
                         if let Some(min) = self.cfg.min_elevation {
