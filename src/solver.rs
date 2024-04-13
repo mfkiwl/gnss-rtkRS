@@ -21,7 +21,7 @@ use crate::{
     bias::{tropo::TroposphereModel, BiasModel, IonosphereBiasModel, IonosphereBiasModelIter},
     cfg::{Config, Method},
     clock::{Clock, ClockIter},
-    ephemerides::EphemeridesIter,
+    ephemerides::{Ephemerides, EphemeridesIter},
     interp::{ClockInterpolator, OrbitInterpolator},
     navigation::{
         lsq::LSQ,
@@ -45,14 +45,12 @@ enum State {
     EphemeridesGathering,
     /// SV Info gathering
     SVInfoGathering,
-    /// Clock data gathering
-    ClockGathering,
     /// Orbital state gathering
     OrbitGathering,
     /// [IonosphereBiasModel] gathering
     IonoModelsGathering,
-    /// SV clock interpolation
-    ClockInterpolation,
+    /// SV clock correction
+    ClockCorrection,
     /// Orbital state interpolation
     OrbitInterpolation,
     /// Navigation
@@ -76,14 +74,12 @@ pub struct Solver {
     min_sv_required: usize,
     /// Type of solutions to resolve
     solutions_type: PVTSolutionType,
-    /// Clock interpolator
-    clock: ClockInterpolator,
     /// Orbit interpolator
     orbit: OrbitInterpolator,
-    /// Time of issue of Ephemeris
-    toe: Vec<Epoch>,
     /// Ionosphere Bias model(s)
     iono_models: Vec<IonosphereBiasModel>,
+    /// Ephemerides
+    eph: Vec<Ephemerides>,
     /// Observations buffer
     signals: Vec<Observation>,
     /// Cosmic model
@@ -158,10 +154,9 @@ impl Solver {
             solutions_type,
             min_sv_required,
             state: State::default(),
-            toe: Vec::with_capacity(16),
+            eph: Vec::with_capacity(16),
             iono_models: Vec::with_capacity(8),
             signals: Vec::with_capacity(64),
-            clock: ClockInterpolator::malloc(128),
             orbit: OrbitInterpolator::malloc(interp_order, 128),
         }
     }
@@ -173,13 +168,21 @@ impl Solver {
         }
     }
     /// Returns TOE
-    fn find_toe(&self, t: Epoch) -> Option<&Epoch> {
-        //self.toe.iter().filter(|toe| **toe <= t).last()
-        // TODO: this value only applies to GPST
-        self.toe
-            .iter()
-            .filter(|toe| (**toe - t).to_seconds().abs() < 4000.0)
-            .reduce(|k, _| k)
+    fn clock_correction(&self, sv: SV, t: Epoch) -> Option<Duration> {
+        const WEEK_SECONDS: f64 = 604800.0;
+        const HALF_WEEK_SECONDS :f64 = WEEK_SECONDS /2.0;
+        let eph = self.eph.iter().filter(|eph| {
+            eph.sv == sv && t >= eph.t && (t - eph.t).to_seconds() < 4000.0
+        }).reduce(|k, _| k)?;
+        debug!("IDENTIFIED: {:?}", eph);
+        let mut dt = (t - eph.toe).to_seconds();
+        // TODO: GPST
+        if dt > HALF_WEEK_SECONDS {
+            dt -= WEEK_SECONDS;
+        } else if dt < -HALF_WEEK_SECONDS {
+            dt += WEEK_SECONDS;
+        }
+        Some(Duration::from_seconds(eph.a0 + eph.a1 * dt + eph.a2 * dt.powi(2)))
     }
     /// Returns [IonosphereBiasModel] currently valid
     fn iono_bias_model(&self, t: Epoch) -> Option<&IonosphereBiasModel> {
@@ -218,19 +221,16 @@ impl Solver {
         E: EphemeridesIter,
         O: ObservationIter,
         OR: OrbitIter,
-        CK: ClockIter,
         IO: IonosphereBiasModelIter,
         S: SVInfoIter,
     >(
         &mut self,
         mut ephemerides: E,
         mut orbit: OR,
-        mut clock: CK,
         mut observation: O,
         mut sv_infos: S,
         mut ionosphere_models: IO,
     ) -> Vec<PVTSolution> {
-        const WEEK_SECONDS: f64 = 604800.0;
         let mut solutions = Vec::<PVTSolution>::new();
 
         let apriori = self.apriori.clone();
@@ -253,22 +253,18 @@ impl Solver {
 
         // interpolated results
         let mut sv_info = Vec::<SVInfo>::with_capacity(32);
-        let mut interpolated_ck = Vec::<Clock>::with_capacity(min_sv_required);
         let mut interpolated_orb = Vec::<Orbit>::with_capacity(min_sv_required);
-        let mut clock_corr = HashMap::<SV, f64>::with_capacity(min_sv_required);
+        let mut clock_corr = HashMap::<SV, Duration>::with_capacity(min_sv_required);
 
         loop {
             debug!("{} - {:?}", self.cfg.method, self.state);
             match self.state {
                 State::EphemeridesGathering => {
-                    while let Some(toe) = ephemerides.next() {
-                        assert!(
-                            toe.time_scale == TimeScale::GPST,
-                            "We only tolerate TOE expressed in GPST at the moment.."
-                        );
-                        self.toe.push(toe);
+                    while let Some(eph) = ephemerides.next() {
+                        self.eph.push(eph);
                     }
-                    // TODO: skip on PPP
+                    debug!("DATASET: {:?}", self.eph);
+                    // TODO: skip if PPP
                     self.state = State::IonoModelsGathering;
                 },
                 State::IonoModelsGathering => {
@@ -280,12 +276,6 @@ impl Solver {
                 State::SVInfoGathering => {
                     while let Some(sv) = sv_infos.next() {
                         sv_info.push(sv);
-                    }
-                    self.state = State::ClockGathering;
-                },
-                State::ClockGathering => {
-                    while let Some(ck) = clock.next() {
-                        self.clock.new_clock(ck);
                     }
                     self.state = State::OrbitGathering;
                 },
@@ -319,8 +309,6 @@ impl Solver {
                         if samp_t != t_rx {
                             // moving to new Epoch
                             t_rx = samp_t;
-                            interpolated_ck.clear();
-                            interpolated_orb.clear();
                             info!("new Epoch {:?}", t_rx);
                         }
 
@@ -343,29 +331,16 @@ impl Solver {
                     } else {
                         debug!("{:?} - {} observations passed quality checks", t_rx, count);
 
-                        self.state = State::ClockInterpolation;
+                        self.state = State::ClockCorrection;
                     }
                 },
-                State::ClockInterpolation => {
-                    for sv in self.signals.iter().map(|sig| sig.sv) {
-                        if let Some(ck) = self.clock.interpolate(sv, t_rx) {
-                            debug!("{:?} ({}) - Interpolated {:?}", t_rx, sv, ck);
-                            interpolated_ck.push(ck);
-                        }
-                    }
-
-                    if interpolated_ck.len() < min_sv_required {
-                        self.signals.clear();
-                        interpolated_ck.clear();
-                        interpolated_orb.clear();
-                        self.state = State::SignalAcquisition;
-                        error!("{:?} - too many (clock) interpolation failures", t_rx);
-                    } else {
-                        //TODO deviation criteria ?
-                        self.state = State::OrbitInterpolation;
-                    }
+                State::ClockCorrection => {
+                    //TODO deviation criteria ?
+                    self.state = State::OrbitInterpolation;
                 },
                 State::OrbitInterpolation => {
+                    interpolated_orb.clear();
+
                     for (sv, pr) in self.signals.iter().map(|sig| (sig.sv, sig.value)) {
                         let mut t_tx = match self.cfg.modeling.signal_propagation {
                             false => t_rx,
@@ -408,35 +383,14 @@ impl Solver {
                         }
 
                         if self.cfg.modeling.sv_clock_bias {
-                            if let Some(toe) = self.find_toe(t_tx) {
-                                let clock = interpolated_ck.iter().find(|ck| ck.sv == sv).unwrap();
-
-                                assert!(
-                                    clock.sv.constellation == Constellation::GPS,
-                                    "Can only process GPS vehicles at the moment.."
-                                );
-
-                                let mut dt = (t_tx - *toe).to_seconds();
-
-                                if dt > WEEK_SECONDS / 2.0 {
-                                    dt -= WEEK_SECONDS;
-                                } else if dt < -WEEK_SECONDS / 2.0 {
-                                    dt += WEEK_SECONDS;
-                                }
-
-                                let correction =
-                                    clock.offset + clock.drift * dt + clock.drift_rate * dt.powi(2);
-
-                                //TODO: il y a aussi une correction d'un effet relativiste là dessus
-
-                                clock_corr.insert(sv, correction);
-                                t_tx -= correction * Unit::Second;
-
+                            if let Some(ck) = self.clock_correction(sv, t_tx) {
+                                t_tx -= ck;
+                                clock_corr.insert(sv, ck);
                                 debug!(
                                     "{:?} ({}) - clock correction {}",
                                     t_rx,
                                     sv,
-                                    Duration::from_seconds(correction)
+                                    ck,
                                 );
                             } else {
                                 error!(
@@ -462,8 +416,7 @@ impl Solver {
                                     );
 
                                 orb.position = (rotated[0], rotated[1], rotated[2]);
-
-                                //TODO: correct velocities as well
+                                //TODO: velocity
                             }
 
                             debug!("{:?} ({}) - Interpolated {:?}", t_rx, sv, orb);
@@ -473,8 +426,6 @@ impl Solver {
 
                     if interpolated_orb.len() < min_sv_required {
                         self.signals.clear();
-                        interpolated_ck.clear();
-                        interpolated_orb.clear();
                         self.state = State::SignalAcquisition;
                         error!("{:?} - too many (orbit) interpolation failures", t_rx);
                     } else {
@@ -514,8 +465,6 @@ impl Solver {
                         //    }
                         if interpolated_orb.len() < min_sv_required {
                             self.signals.clear();
-                            interpolated_ck.clear();
-                            interpolated_orb.clear();
                             self.state = State::SignalAcquisition;
                             error!("{:?} - too many SV below attitude criteria", t_rx);
                         } else {
@@ -532,11 +481,6 @@ impl Solver {
                             .find(|orb| orb.sv == signal.sv)
                             .unwrap();
 
-                        let clock = interpolated_ck
-                            .iter()
-                            .find(|ck| ck.sv == signal.sv)
-                            .unwrap();
-
                         let (sv_x, sv_y, sv_z) = orbit.position;
                         let rho = ((sv_x - x0).powi(2) + (sv_y - y0).powi(2) + (sv_z - z0).powi(2))
                             .sqrt();
@@ -545,7 +489,7 @@ impl Solver {
                             if let Some((_, clock_corr)) =
                                 clock_corr.iter().find(|(k, _)| **k == signal.sv)
                             {
-                                biases -= clock_corr * SPEED_OF_LIGHT;
+                                biases -= clock_corr.to_seconds() * SPEED_OF_LIGHT;
                             } else {
                                 error!(
                                     "{} ({}) - undetermined ephemeris: aborting",

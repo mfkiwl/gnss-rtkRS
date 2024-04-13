@@ -26,7 +26,7 @@ pub mod prelude {
     };
     pub use crate::cfg::{Config, Filter, Method};
     pub use crate::clock::{Clock, ClockIter};
-    pub use crate::ephemerides::EphemeridesIter;
+    pub use crate::ephemerides::{Ephemerides, EphemeridesIter};
     pub use crate::navigation::solutions::{PVTSolution, PVTSolutionType};
     pub use crate::observation::{Observation, ObservationIter};
     pub use crate::orbit::{Orbit, OrbitIter};
