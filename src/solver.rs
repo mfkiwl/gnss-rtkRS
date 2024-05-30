@@ -383,7 +383,6 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
 
         /* apply eclipse filter (if need be) */
         if let Some(min_rate) = self.cfg.min_sv_sunlight_rate {
-            let mut nb_removed: usize = 0;
             pool.retain(|cd| {
                 let state = cd.state.unwrap(); // infaillible
                 let orbit = state.orbit(cd.t, self.earth_frame);
@@ -418,7 +417,7 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
             // update attitudes
             for cd in pool.iter_mut() {
                 let mut state = cd.state.unwrap();
-                state.with_elevation_azimuth((x0, y0, z0));
+                state = state.with_elevation_azimuth((x0, y0, z0));
             }
             // store
             self.initial = Some(Position::from_ecef(Vector3::new(
@@ -447,7 +446,7 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
         );
         let (lat_ddeg, lon_ddeg) = (deg2rad(lat_rad), deg2rad(lon_rad));
 
-        let mut w = self.cfg.solver.weight_matrix(); //sv.values().map(|sv| sv.elevation).collect());
+        let mut w = self.cfg.solver.weight_matrix(4); //sv.values().map(|sv| sv.elevation).collect());
 
         // // Reduce contribution of newer (rising) vehicles (rising)
         // for (i, cd) in pool.iter().enumerate() {
@@ -457,12 +456,11 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
         //     }
         // }
 
-        let mut input = match NavigationInput::new(
+        let input = match NavigationInput::new(
             (x0, y0, z0),
             (lat_ddeg, lon_ddeg, altitude_above_sea_m),
             &self.cfg,
             &pool,
-            w,
             &ambiguities,
             iono_bias,
             tropo_bias,
@@ -474,10 +472,12 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
             },
         };
 
+        debug!("w: {}", w);
+
         self.prev_used = pool.iter().map(|cd| cd.sv).collect::<Vec<_>>();
 
         // Regular Iteration
-        let output = match self.nav.resolve(&input) {
+        let output = match self.nav.resolve(&input, &w) {
             Ok(output) => output,
             Err(e) => {
                 error!("Failed to resolve: {}", e);
@@ -516,7 +516,7 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
         }
 
         let validator =
-            SolutionValidator::new(Vector3::<f64>::new(x0, y0, z0), &pool, &input, &output);
+            SolutionValidator::new(Vector3::<f64>::new(x0, y0, z0), &pool, &input, &w, &output);
 
         match validator.validate(solver_opts) {
             Ok(_) => {
@@ -560,7 +560,7 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
     /* returns minimal number of SV */
     fn min_sv_required(&self) -> usize {
         if self.initial.is_none() {
-            4
+            6
         } else {
             match self.cfg.sol_type {
                 PVTSolutionType::TimeOnly => 1,
@@ -568,7 +568,7 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
                     if self.cfg.fixed_altitude.is_some() {
                         3
                     } else {
-                        4
+                        6
                     }
                 },
             }
@@ -626,67 +626,66 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
             pvt.velocity = Default::default();
         }
     }
-    /*
-     * Minimize geometry error
-     */
-    fn minimize_geometry_error(candidates: &mut Vec<Candidate>, min_required: usize) {
-        let nb_candidates = candidates.len();
-        let (mut sv_min_elev, mut min_elev) = (SV::default(), 365.0_f64);
-        let (mut sv_max_elev, mut max_elev) = (SV::default(), 0.0_f64);
+    // /*
+    // * Minimize geometry error
+    // */
+    //fn minimize_geometry_error(candidates: &mut Vec<Candidate>, min_required: usize) {
+    //    let nb_candidates = candidates.len();
+    //    let (mut sv_min_elev, mut min_elev) = (SV::default(), 365.0_f64);
+    //    let (mut sv_max_elev, mut max_elev) = (SV::default(), 0.0_f64);
 
-        for cd in candidates.iter() {
-            let state = cd.state.unwrap();
-            if state.elevation < min_elev {
-                sv_min_elev = cd.sv;
-                min_elev = state.elevation;
-            }
-            if state.elevation > max_elev {
-                sv_max_elev = cd.sv;
-                max_elev = state.elevation;
-            }
-        }
+    //    for cd in candidates.iter() {
+    //        let state = cd.state.unwrap();
+    //        if state.elevation < min_elev {
+    //            sv_min_elev = cd.sv;
+    //            min_elev = state.elevation;
+    //        }
+    //        if state.elevation > max_elev {
+    //            sv_max_elev = cd.sv;
+    //            max_elev = state.elevation;
+    //        }
+    //    }
 
-        debug!("sv_min_elev: {}, sv_max_elev: {}", sv_min_elev, sv_max_elev);
+    //    debug!("sv_min_elev: {}, sv_max_elev: {}", sv_min_elev, sv_max_elev);
 
-        let mut retained = Vec::<SV>::with_capacity(min_required);
-        retained.push(sv_min_elev);
-        retained.push(sv_max_elev);
+    //    let mut retained = Vec::<SV>::with_capacity(min_required);
+    //    retained.push(sv_min_elev);
+    //    retained.push(sv_max_elev);
 
-        let mut combinations: Vec<(Vec<SV>, f64)> = Vec::with_capacity(16);
-        for combination in candidates.iter().combinations(min_required) {
-            let mut mean = 0.0_f64;
-            for cd in combination.iter() {
-                let state = cd.state.unwrap();
-                mean += state.azimuth;
-            }
-            mean /= min_required as f64;
-            let mut dev = 0.0_f64;
-            for cd in combination.iter() {
-                let state = cd.state.unwrap();
-                dev += (state.azimuth - mean).powi(2);
-            }
-            dev /= min_required as f64;
-            let svs = combination.iter().map(|cd| cd.sv).collect::<Vec<_>>();
-            combinations.push((svs, dev));
-        }
+    //    let mut combinations: Vec<(Vec<SV>, f64)> = Vec::with_capacity(16);
+    //    for combination in candidates.iter().combinations(min_required) {
+    //        let mut mean = 0.0_f64;
+    //        for cd in combination.iter() {
+    //            let state = cd.state.unwrap();
+    //            mean += state.azimuth;
+    //        }
+    //        mean /= min_required as f64;
+    //        let mut dev = 0.0_f64;
+    //        for cd in combination.iter() {
+    //            let state = cd.state.unwrap();
+    //            dev += (state.azimuth - mean).powi(2);
+    //        }
+    //        dev /= min_required as f64;
+    //        let svs = combination.iter().map(|cd| cd.sv).collect::<Vec<_>>();
+    //        combinations.push((svs, dev));
+    //    }
 
-        combinations.sort_by(|(_, dev_a), (_, dev_b)| dev_b.partial_cmp(&dev_a).unwrap());
+    //    combinations.sort_by(|(_, dev_a), (_, dev_b)| dev_b.partial_cmp(&dev_a).unwrap());
 
-        for i in 0..combinations.len() {
-            for sv in &combinations[combinations.len() - i - 1].0 {
-                if !retained.contains(sv) {
-                    retained.push(*sv);
-                }
-                if retained.len() == min_required {
-                    break;
-                }
-            }
-        }
-        println!("RETAINED: {:?}", retained);
+    //    for i in 0..combinations.len() {
+    //        for sv in &combinations[combinations.len() - i - 1].0 {
+    //            if !retained.contains(sv) {
+    //                retained.push(*sv);
+    //            }
+    //            if retained.len() == min_required {
+    //                break;
+    //            }
+    //        }
+    //    }
+    //    println!("RETAINED: {:?}", retained);
 
-        let mut index = 0;
-        candidates.retain(|cd| retained.contains(&cd.sv));
-    }
+    //    candidates.retain(|cd| retained.contains(&cd.sv));
+    //}
     fn retain_best_elevation(pool: &mut Vec<Candidate>, min_required: usize) {
         let mut index = 0;
         let total = pool.len();

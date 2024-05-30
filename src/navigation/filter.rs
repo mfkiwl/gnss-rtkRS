@@ -1,4 +1,4 @@
-use nalgebra::{base::dimension::U8, OMatrix, OVector, Vector3};
+use nalgebra::{base::dimension::U8, DMatrix, DVector, OMatrix, OVector, Vector3};
 
 #[cfg(feature = "serde")]
 use serde::Deserialize;
@@ -20,18 +20,18 @@ pub enum Filter {
     Kalman,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct LSQState {
-    pub p: OMatrix<f64, U8, U8>,
-    pub x: OVector<f64, U8>,
+    pub p: DMatrix<f64>,
+    pub x: DVector<f64>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct KFState {
-    pub q: OMatrix<f64, U8, U8>,
-    pub p: OMatrix<f64, U8, U8>,
-    pub x: OVector<f64, U8>,
-    pub phi: OMatrix<f64, U8, U8>,
+    pub q: DMatrix<f64>,
+    pub p: DMatrix<f64>,
+    pub x: DVector<f64>,
+    pub phi: DMatrix<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,65 +40,42 @@ pub enum FilterState {
     Kf(KFState),
 }
 
-impl Default for FilterState {
-    fn default() -> Self {
-        Self::Lsq(Default::default())
-    }
-}
-
 impl FilterState {
     fn lsq(state: LSQState) -> Self {
         Self::Lsq(state)
     }
-    //fn as_lsq(&self) -> Option<&LSQState> {
-    //    match self {
-    //        Self::LSQ(state) => Some(state),
-    //        _ => None,
-    //    }
-    //}
-    pub fn ambiguities(&self) -> Vec<f64> {
-        let x = match self {
-            Self::Lsq(state) => state.x,
-            Self::Kf(state) => state.x,
-        };
-        let mut r = Vec::<f64>::new();
-        for i in 4..x.len() {
-            r.push(x[i]);
-        }
-        r
-    }
     fn kf(state: KFState) -> Self {
         Self::Kf(state)
     }
-    //fn as_kf(&self) -> Option<&KFState> {
-    //    match self {
-    //        Self::KF(state) => Some(state),
-    //        _ => None,
-    //    }
-    //}
-    pub(crate) fn estimate(&self) -> OVector<f64, U8> {
+    pub(crate) fn estimate(&self) -> &DVector<f64> {
         match self {
-            Self::Lsq(state) => state.x,
-            Self::Kf(state) => state.x,
+            Self::Lsq(state) => &state.x,
+            Self::Kf(state) => &state.x,
         }
     }
 }
 
 impl Filter {
-    fn lsq_resolve(input: &Input, p_state: Option<FilterState>) -> Result<Output, Error> {
+    fn lsq_resolve(
+        input: &Input,
+        w: &DMatrix<f64>,
+        p_state: Option<FilterState>,
+    ) -> Result<Output, Error> {
         match p_state {
             Some(FilterState::Lsq(p_state)) => {
                 let p_1 = p_state.p.try_inverse().ok_or(Error::MatrixInversionError)?;
 
                 let g_prime = input.g.clone().transpose();
-                let q = (g_prime * input.g)
+                let q = (g_prime.clone() * input.g.clone())
                     .try_inverse()
                     .ok_or(Error::MatrixInversionError)?;
 
-                let p = g_prime * input.w * input.g;
-                let p = (p_1 + p).try_inverse().ok_or(Error::MatrixInversionError)?;
+                let p = g_prime.clone() * w * input.g.clone();
+                let p = (p_1.clone() + p)
+                    .try_inverse()
+                    .ok_or(Error::MatrixInversionError)?;
 
-                let x = p * (p_1 * p_state.x + (g_prime * input.w * input.y));
+                let x = p.clone() * (p_1 * p_state.x + (g_prime * w * input.y.clone()));
 
                 Ok(Output {
                     gdop: (q[(0, 0)] + q[(1, 1)] + q[(2, 2)] + q[(3, 3)]).sqrt(),
@@ -111,15 +88,15 @@ impl Filter {
             _ => {
                 let g_prime = input.g.clone().transpose();
 
-                let q = (g_prime * input.g)
+                let q = (g_prime.clone() * input.g.clone())
                     .try_inverse()
                     .ok_or(Error::MatrixInversionError)?;
 
-                let p = (g_prime * input.w * input.g)
+                let p = (g_prime.clone() * w * input.g.clone())
                     .try_inverse()
                     .ok_or(Error::MatrixInversionError)?;
 
-                let x = p * (g_prime * input.w * input.y);
+                let x = p.clone() * (g_prime.clone() * w * input.y.clone());
                 if x[3].is_nan() {
                     return Err(Error::TimeIsNan);
                 }
@@ -134,24 +111,34 @@ impl Filter {
             },
         }
     }
-    fn kf_resolve(input: &Input, p_state: Option<FilterState>) -> Result<Output, Error> {
+    fn kf_resolve(
+        input: &Input,
+        w: &DMatrix<f64>,
+        p_state: Option<FilterState>,
+    ) -> Result<Output, Error> {
         match p_state {
             Some(FilterState::Kf(p_state)) => {
-                let x_bn = p_state.phi * p_state.x;
-                let p_bn = p_state.phi * p_state.p * p_state.phi.transpose() + p_state.q;
+                let x_bn = p_state.phi.clone() * p_state.x;
+                let p_bn = p_state.phi.clone() * p_state.p * p_state.phi.transpose() + p_state.q;
 
                 let p_bn_inv = p_bn.try_inverse().ok_or(Error::MatrixInversionError)?;
-                let p_n = (input.g.transpose() * input.w * input.g + p_bn_inv)
+                let p_n = (input.g.transpose() * w * input.g.clone() + p_bn_inv.clone())
                     .try_inverse()
                     .ok_or(Error::MatrixInversionError)?;
 
-                let w_g = input.g.transpose() * input.w * input.y;
+                let w_g = input.g.transpose() * w * input.y.clone();
                 let w_gy_pbn = w_g + (p_bn_inv * x_bn);
-                let x_n = p_n * w_gy_pbn;
+                let x_n = p_n.clone() * w_gy_pbn;
 
-                let q_n = input.g.transpose() * input.g;
-                let phi_diag = OVector::<f64, U8>::from([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
-                let q_diag = OVector::<f64, U8>::from([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+                let q_n = input.g.transpose() * input.g.clone();
+
+                let mut q_diag = DVector::<f64>::zeros(8);
+                let mut phi_diag = DVector::<f64>::zeros(8);
+
+                for i in 0..8 {
+                    phi_diag[i] = 1.0;
+                }
+                q_diag[7] = 1.0;
 
                 Ok(Output {
                     gdop: (q_n[(0, 0)] + q_n[(1, 1)] + q_n[(2, 2)] + q_n[(3, 3)]).sqrt(),
@@ -161,28 +148,33 @@ impl Filter {
                     state: FilterState::kf(KFState {
                         p: p_n,
                         x: x_n,
-                        q: OMatrix::<f64, U8, U8>::from_diagonal(&q_diag),
-                        phi: OMatrix::<f64, U8, U8>::from_diagonal(&phi_diag),
+                        q: DMatrix::<f64>::from_diagonal(&q_diag),
+                        phi: DMatrix::<f64>::from_diagonal(&phi_diag),
                     }),
                 })
             },
             _ => {
                 let g_prime = input.g.clone().transpose();
-                let q = (g_prime * input.g)
+                let q = (g_prime.clone() * input.g.clone())
                     .try_inverse()
                     .ok_or(Error::MatrixInversionError)?;
 
-                let p = (g_prime * input.w * input.g)
+                let p = (g_prime.clone() * w * input.g.clone())
                     .try_inverse()
                     .ok_or(Error::MatrixInversionError)?;
 
-                let x = p * (g_prime * input.w * input.y);
+                let x = p.clone() * (g_prime.clone() * w * input.y.clone());
                 if x[3].is_nan() {
                     return Err(Error::TimeIsNan);
                 }
 
-                let phi_diag = OVector::<f64, U8>::from([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
-                let q_diag = OVector::<f64, U8>::from([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+                let mut q_diag = DVector::<f64>::zeros(8);
+                let mut phi_diag = DVector::<f64>::zeros(8);
+
+                for i in 0..8 {
+                    phi_diag[i] = 1.0;
+                }
+                q_diag[7] = 1.0;
 
                 Ok(Output {
                     gdop: (q[(0, 0)] + q[(1, 1)] + q[(2, 2)] + q[(3, 3)]).sqrt(),
@@ -192,18 +184,22 @@ impl Filter {
                     state: FilterState::kf(KFState {
                         p,
                         x,
-                        q: OMatrix::<f64, U8, U8>::from_diagonal(&q_diag),
-                        phi: OMatrix::<f64, U8, U8>::from_diagonal(&phi_diag),
+                        q: DMatrix::<f64>::from_diagonal(&q_diag),
+                        phi: DMatrix::<f64>::from_diagonal(&phi_diag),
                     }),
                 })
             },
         }
     }
-    pub fn resolve(&self, input: &Input, p_state: Option<FilterState>) -> Result<Output, Error> {
+    pub fn resolve(
+        &self,
+        input: &Input,
+        w: &DMatrix<f64>,
+        p_state: Option<FilterState>,
+    ) -> Result<Output, Error> {
         match self {
-            Filter::None => Self::lsq_resolve(input, None),
-            Filter::LSQ => Self::lsq_resolve(input, p_state),
-            Filter::Kalman => Self::kf_resolve(input, p_state),
+            Filter::Kalman => Self::kf_resolve(input, w, p_state),
+            Filter::LSQ | _ => Self::lsq_resolve(input, w, p_state),
         }
     }
 }

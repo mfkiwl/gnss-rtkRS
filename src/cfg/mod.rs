@@ -8,7 +8,7 @@ use crate::{
     prelude::{PVTSolutionType, TimeScale},
 };
 
-use nalgebra::{base::dimension::U8, OMatrix};
+use nalgebra::{base::dimension::U12, DMatrix};
 
 mod method;
 pub use method::Method;
@@ -194,8 +194,8 @@ impl SolverOpts {
     /*
      * form the weight matrix to be used in the solving process
      */
-    pub(crate) fn weight_matrix(&self) -> OMatrix<f64, U8, U8> {
-        let mat = OMatrix::<f64, U8, U8>::identity();
+    pub(crate) fn weight_matrix(&self, dim: usize) -> DMatrix<f64> {
+        let mut mat = DMatrix::<f64>::identity(dim, dim);
         if let Some(opts) = &self.filter_opts {
             match &opts.weight_matrix {
                 Some(WeightMatrix::Covar) => panic!("not implemented yet"),

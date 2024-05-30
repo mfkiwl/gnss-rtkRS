@@ -1,5 +1,5 @@
 use log::debug;
-use nalgebra::{DVector, Vector3};
+use nalgebra::{DMatrix, DVector, Vector3};
 use nyx::cosmic::SPEED_OF_LIGHT;
 use thiserror::Error;
 
@@ -32,6 +32,7 @@ impl Validator {
         apriori_ecef: Vector3<f64>,
         pool: &[Candidate],
         input: &Input,
+        w: &DMatrix<f64>,
         output: &Output,
     ) -> Self {
         let gdop = output.gdop;
@@ -69,13 +70,13 @@ impl Validator {
             residuals[idx] += dt * SPEED_OF_LIGHT;
             residuals[idx] -= sv.tropo_bias.value().unwrap_or(0.0);
             residuals[idx] -= sv.iono_bias.value().unwrap_or(0.0);
-            residuals[idx] /= input.w[(idx, idx)];
+            residuals[idx] /= w[(idx, idx)];
             debug!(
                 "{} ({}): coderes={}/w={}",
                 cd.t,
                 cd.sv,
                 residuals[idx],
-                input.w[(idx, idx)]
+                w[(idx, idx)]
             );
         }
         Self {

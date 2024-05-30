@@ -18,8 +18,9 @@ use crate::{
 
 use nalgebra::{
     base::dimension::{U4, U8},
-    OMatrix, OVector,
+    DMatrix, DVector, OMatrix, OVector,
 };
+
 use nyx::cosmic::SPEED_OF_LIGHT;
 
 /// SV Navigation information
@@ -39,17 +40,15 @@ pub struct SVInput {
 #[derive(Debug, Clone)]
 pub struct Input {
     /// Measurement vector
-    pub y: OVector<f64, U8>,
+    pub y: DVector<f64>,
     /// NAV Matrix
-    pub g: OMatrix<f64, U8, U8>,
-    /// Weight Diagonal Matrix
-    pub w: OMatrix<f64, U8, U8>,
+    pub g: DMatrix<f64>,
     /// SV dependent data
     pub sv: HashMap<SV, SVInput>,
 }
 
 /// Navigation Output
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Output {
     /// Time Dilution of Precision
     pub tdop: f64,
@@ -58,7 +57,7 @@ pub struct Output {
     /// Position Dilution of Precision
     pub pdop: f64,
     /// Q covariance matrix
-    pub q: OMatrix<f64, U8, U8>,
+    pub q: DMatrix<f64>,
     /// Filter state
     pub state: FilterState,
 }
@@ -93,13 +92,12 @@ impl Input {
         apriori_geo: (f64, f64, f64),
         cfg: &Config,
         cd: &[Candidate],
-        w: OMatrix<f64, U8, U8>,
         ambiguities: &Ambiguities,
         iono_bias: &IonosphereBias,
         tropo_bias: &TroposphereBias,
     ) -> Result<Self, Error> {
-        let mut y = OVector::<f64, U8>::zeros();
-        let mut g = OMatrix::<f64, U8, U8>::zeros();
+        let mut y = DVector::<f64>::zeros(4);
+        let mut g = DMatrix::<f64>::zeros(4, 4);
         let mut sv = HashMap::<SV, SVInput>::with_capacity(cd.len());
         /*
          * Compensate for ARP (if possible)
@@ -115,7 +113,7 @@ impl Input {
 
         let (x0, y0, z0) = apriori;
 
-        for i in 0..8 {
+        for i in 0..10 {
             let mut sv_input = SVInput::default();
 
             let index = if i >= cd.len() {
@@ -224,7 +222,7 @@ impl Input {
 
             y[i] = pr - rho - models;
 
-            if i > 3 {
+            if i > 5 {
                 g[(i, i)] = 1.0_f64;
 
                 if cfg.method == Method::PPP {
@@ -268,15 +266,15 @@ impl Input {
             }
         }
 
-        debug!("y: {} g: {}, w: {}", y, g, w);
-        Ok(Self { y, g, w, sv })
+        debug!("y: {} g: {}", y, g);
+        Ok(Self { y, g, sv })
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Navigation {
     filter: Filter,
-    pending: Output,
+    pending: Option<Output>,
     filter_state: Option<FilterState>,
 }
 
@@ -284,16 +282,18 @@ impl Navigation {
     pub fn new(filter: Filter) -> Self {
         Self {
             filter,
+            pending: None,
             filter_state: None,
-            pending: Default::default(),
         }
     }
-    pub fn resolve(&mut self, input: &Input) -> Result<Output, Error> {
-        let out = self.filter.resolve(input, self.filter_state.clone())?;
-        self.pending = out.clone();
+    pub fn resolve(&mut self, input: &Input, w: &DMatrix<f64>) -> Result<Output, Error> {
+        let out = self.filter.resolve(input, w, self.filter_state.clone())?;
+        self.pending = Some(out.clone());
         Ok(out)
     }
     pub fn validate(&mut self) {
-        self.filter_state = Some(self.pending.state.clone());
+        if let Some(pending) = &self.pending {
+            self.filter_state = Some(pending.state.clone());
+        }
     }
 }
