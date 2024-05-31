@@ -162,7 +162,7 @@ impl Candidate {
     }
     // True if Self is Method::CPP compatible
     pub(crate) fn cpp_compatible(&self) -> bool {
-        self.dual_pseudorange()
+        self.code_if_combination().is_some()
     }
     // True if Self is Method::PPP compatible
     pub(crate) fn ppp_compatible(&self) -> bool {
@@ -170,21 +170,11 @@ impl Candidate {
     }
     // True if dual PR is present
     pub(crate) fn dual_pseudorange(&self) -> bool {
-        self.pseudo_range
-            .iter()
-            .map(|c| (c.carrier.frequency() / 1.0E6) as u16)
-            .unique()
-            .count()
-            > 1
+        self.pseudo_range.iter().map(|c| c.carrier).unique().count() > 1
     }
     // True if dual phase is present
     pub(crate) fn dual_phase(&self) -> bool {
-        self.phase_range
-            .iter()
-            .map(|c| (c.carrier.frequency() / 1.0E6) as u16)
-            .unique()
-            .count()
-            > 1
+        self.phase_range.iter().map(|c| c.carrier).unique().count() > 1
     }
     // Returns the L1 Pseudo Range observation [m] if it exists
     pub(crate) fn l1_pseudorange(&self) -> Option<&PseudoRange> {

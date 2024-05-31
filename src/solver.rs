@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 
 use hifitime::Unit;
-use itertools::Itertools;
+// use itertools::Itertools;
 use log::{debug, error, warn};
 use map_3d::{deg2rad, ecef2geodetic, rad2deg};
 use nalgebra::{Matrix3, Vector3};
@@ -25,8 +25,8 @@ use crate::{
     candidate::Candidate,
     cfg::{Config, Method},
     navigation::{
-        solutions::validator::Validator as SolutionValidator, Input as NavigationInput, Navigation,
-        PVTSolution, PVTSolutionType,
+        solutions::validator::Validator as SolutionValidator, Filter, FilterState,
+        Input as NavigationInput, PVTSolution, PVTSolutionType,
     },
     position::Position,
     prelude::{Duration, Epoch, SV},
@@ -155,8 +155,7 @@ impl InterpolationResult {
             frame,
         )
     }
-    #[cfg(test)]
-    fn set_elevation(&mut self, elev: f64) {
+    pub(crate) fn set_elevation(&mut self, elev: f64) {
         self.elevation = elev;
     }
 }
@@ -181,10 +180,10 @@ where
     earth_frame: Frame,
     // Sun / Star body frame
     sun_frame: Frame,
-    // Navigator
-    nav: Navigation,
     // Solver
     ambiguity: AmbiguitySolver,
+    // Filter
+    state: FilterState,
     // Post fit KF
     // postfit_kf: Option<KF<State3D, U3, U3>>,
     /* prev. solution for internal logic */
@@ -227,11 +226,11 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
             prev_used: vec![],
             cfg: cfg.clone(),
             prev_solution: None,
-            // TODO
-            ambiguity: AmbiguitySolver::new(Duration::from_seconds(120.0)),
             // postfit_kf: None,
             prev_sv_state: HashMap::new(),
-            nav: Navigation::new(cfg.solver.filter),
+            state: FilterState::init(cfg.solver.filter),
+            // TODO
+            ambiguity: AmbiguitySolver::new(Duration::from_seconds(120.0)),
         })
     }
     /// [PVTSolution] resolution attempt.
@@ -311,6 +310,7 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
                     if let Some(initial) = &self.initial {
                         let (x0, y0, z0) = (initial.ecef[0], initial.ecef[1], initial.ecef[2]);
                         interpolated = interpolated.with_elevation_azimuth((x0, y0, z0));
+                        debug!("{} ({}) : {:?}", cd.t, cd.sv, interpolated);
                     } else {
                         min_elev = 0.0_f64; // cannot apply yet
                         min_azim = 0.0_f64; // cannot apply yet
@@ -341,7 +341,6 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
                             Self::rotate_position(modeling.earth_rotation, interpolated, dt_tx);
                         let interpolated = self.velocities(t_tx, cd.sv, interpolated);
                         cd.t_tx = t_tx;
-                        debug!("{} ({}) : {:?}", cd.t, cd.sv, interpolated);
                         cd.state = Some(interpolated);
                         Some(cd)
                     }
@@ -416,8 +415,10 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
             );
             // update attitudes
             for cd in pool.iter_mut() {
-                let mut state = cd.state.unwrap();
-                state = state.with_elevation_azimuth((x0, y0, z0));
+                if let Some(ref mut state) = cd.state {
+                    *state = state.with_elevation_azimuth((x0, y0, z0));
+                    debug!("{} ({}) : {:?}", cd.t, cd.sv, state);
+                }
             }
             // store
             self.initial = Some(Position::from_ecef(Vector3::new(
@@ -432,9 +433,14 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
             Default::default()
         };
 
-        // Prepare for NAV:
+        // Prepare for NAV
+        //   [+] retain best elev
+        //   [+] make sure we're still compliant
+        //   [+] sort by PRN to form consistant matrix
         Self::retain_best_elevation(&mut pool, min_required);
-        // Sort by PRN to form consistant matrix
+        if pool.len() < min_required {
+            return Err(Error::NotEnoughMatchingCandidates);
+        }
         pool.sort_by(|cd_a, cd_b| cd_a.sv.prn.partial_cmp(&cd_b.sv.prn).unwrap());
 
         let initial = self.initial.as_ref().unwrap();
@@ -446,9 +452,8 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
         );
         let (lat_ddeg, lon_ddeg) = (deg2rad(lat_rad), deg2rad(lon_rad));
 
-        let mut w = self.cfg.solver.weight_matrix(4); //sv.values().map(|sv| sv.elevation).collect());
-
-        // // Reduce contribution of newer (rising) vehicles (rising)
+        let w = self.cfg.solver.weight_matrix(pool.len() * 2);
+        // // Reduce newer (rising) vehicles contribution
         // for (i, cd) in pool.iter().enumerate() {
         //     if !self.prev_used.contains(&cd.sv) {
         //         w[(i, i)] = 0.05;
@@ -467,17 +472,15 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
         ) {
             Ok(input) => input,
             Err(e) => {
-                error!("Failed to form navigation matrix: {}", e);
+                error!("Navigation input error: {}", e);
                 return Err(Error::MatrixError);
             },
         };
 
         debug!("w: {}", w);
 
-        self.prev_used = pool.iter().map(|cd| cd.sv).collect::<Vec<_>>();
-
-        // Regular Iteration
-        let output = match self.nav.resolve(&input, &w) {
+        // update navigation state
+        let output = match self.state.update(&input, &w) {
             Ok(output) => output,
             Err(e) => {
                 error!("Failed to resolve: {}", e);
@@ -485,14 +488,18 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
             },
         };
 
-        let x = output.state.estimate();
+        self.prev_used = pool.iter().map(|cd| cd.sv).collect::<Vec<_>>();
+
+        let x = self.state.estimate();
+        debug!("x: {}", x);
+
         let position = match method {
             // Method::PPP => Vector3::new(x[4] + x0, x[5] + y0, x[6] + z0),
             Method::PPP => {
-                debug!("b_c(0): {} b_c(1): {}", x[4], x[5]);
+                debug!("b_c: {:?}", x[4]); //TODO: show others, slice(&)
                 Vector3::new(x[0] + x0, x[1] + y0, x[2] + z0)
             },
-            Method::SPP | Method::CPP => Vector3::new(x[0] + x0, x[1] + y0, x[2] + z0),
+            _ => Vector3::new(x[0] + x0, x[1] + y0, x[2] + z0),
         };
 
         let mut solution = PVTSolution {
@@ -515,12 +522,18 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
             return Err(Error::InvalidatedSolution);
         }
 
-        let validator =
-            SolutionValidator::new(Vector3::<f64>::new(x0, y0, z0), &pool, &input, &w, &output);
+        let validator = SolutionValidator::new(
+            Vector3::<f64>::new(x0, y0, z0),
+            &pool,
+            &input,
+            &w,
+            &output,
+            &self.state,
+        );
 
         match validator.validate(solver_opts) {
             Ok(_) => {
-                self.nav.validate();
+                // self.nav.validate();
             },
             Err(e) => {
                 error!("solution invalidated - {}", e);
@@ -560,7 +573,7 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
     /* returns minimal number of SV */
     fn min_sv_required(&self) -> usize {
         if self.initial.is_none() {
-            6
+            4
         } else {
             match self.cfg.sol_type {
                 PVTSolutionType::TimeOnly => 1,
@@ -568,7 +581,7 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
                     if self.cfg.fixed_altitude.is_some() {
                         3
                     } else {
-                        6
+                        4
                     }
                 },
             }
@@ -688,18 +701,14 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
     //}
     fn retain_best_elevation(pool: &mut Vec<Candidate>, min_required: usize) {
         let mut index = 0;
-        let total = pool.len();
-
-        //   1. Retain best elevation
-        pool.sort_by(|cd_a, cd_b| {
-            let state_a = cd_a.state.unwrap();
-            let state_b = cd_b.state.unwrap();
-            state_a.elevation.partial_cmp(&state_b.elevation).unwrap()
-        });
-
-        pool.retain(|_| {
-            index += 1;
-            index > total - min_required
+        pool.retain(|cd| {
+            let state = cd.state.unwrap();
+            if state.elevation > 10.0 {
+                index += 1;
+                index <= min_required
+            } else {
+                false
+            }
         });
     }
 }

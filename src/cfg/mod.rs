@@ -8,7 +8,7 @@ use crate::{
     prelude::{PVTSolutionType, TimeScale},
 };
 
-use nalgebra::{base::dimension::U12, DMatrix};
+use nalgebra::DMatrix;
 
 mod method;
 pub use method::Method;

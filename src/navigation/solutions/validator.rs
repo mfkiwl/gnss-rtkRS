@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use crate::{
     cfg::SolverOpts,
+    navigation::filter::FilterState,
     navigation::{Input, Output},
     prelude::Candidate,
 };
@@ -34,6 +35,7 @@ impl Validator {
         input: &Input,
         w: &DMatrix<f64>,
         output: &Output,
+        state: &FilterState,
     ) -> Self {
         let gdop = output.gdop;
         let tdop = output.tdop;
@@ -49,7 +51,7 @@ impl Validator {
 
             let pr = cd.prefered_pseudorange().unwrap().value;
 
-            let x = output.state.estimate();
+            let x = state.estimate();
 
             let (x, y, z, dt) = (
                 apriori_ecef[0] + x[0],

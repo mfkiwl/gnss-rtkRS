@@ -16,10 +16,7 @@ use crate::{
     prelude::{Error, Method, SV},
 };
 
-use nalgebra::{
-    base::dimension::{U4, U8},
-    DMatrix, DVector, OMatrix, OVector,
-};
+use nalgebra::{base::dimension::U4, DMatrix, DVector, OMatrix};
 
 use nyx::cosmic::SPEED_OF_LIGHT;
 
@@ -58,8 +55,6 @@ pub struct Output {
     pub pdop: f64,
     /// Q covariance matrix
     pub q: DMatrix<f64>,
-    /// Filter state
-    pub state: FilterState,
 }
 
 impl Output {
@@ -96,8 +91,8 @@ impl Input {
         iono_bias: &IonosphereBias,
         tropo_bias: &TroposphereBias,
     ) -> Result<Self, Error> {
-        let mut y = DVector::<f64>::zeros(4);
-        let mut g = DMatrix::<f64>::zeros(4, 4);
+        let mut y = DVector::<f64>::zeros(cd.len() * 2);
+        let mut g = DMatrix::<f64>::zeros(cd.len() * 2, 4 + cd.len());
         let mut sv = HashMap::<SV, SVInput>::with_capacity(cd.len());
         /*
          * Compensate for ARP (if possible)
@@ -113,21 +108,11 @@ impl Input {
 
         let (x0, y0, z0) = apriori;
 
-        for i in 0..10 {
+        for row in 0..cd.len() {
             let mut sv_input = SVInput::default();
 
-            let index = if i >= cd.len() {
-                if cfg.sol_type == PVTSolutionType::TimeOnly {
-                    0
-                } else {
-                    i - cd.len()
-                }
-            } else {
-                i
-            };
-
-            let state = cd[index].state.ok_or(Error::UnresolvedState)?;
-            let clock_corr = cd[index].clock_corr.to_seconds();
+            let state = cd[row].state.ok_or(Error::UnresolvedState)?;
+            let clock_corr = cd[row].clock_corr.to_seconds();
 
             let (azimuth, elevation) = (state.azimuth, state.elevation);
             sv_input.azimuth = azimuth;
@@ -137,10 +122,16 @@ impl Input {
             let rho = ((sv_x - x0).powi(2) + (sv_y - y0).powi(2) + (sv_z - z0).powi(2)).sqrt();
             let (x_i, y_i, z_i) = ((x0 - sv_x) / rho, (y0 - sv_y) / rho, (z0 - sv_z) / rho);
 
-            g[(i, 0)] = x_i;
-            g[(i, 1)] = y_i;
-            g[(i, 2)] = z_i;
-            g[(i, 3)] = 1.0_f64;
+            g[(2 * row, 0)] = x_i;
+            g[(2 * row, 1)] = y_i;
+            g[(2 * row, 2)] = z_i;
+            g[(2 * row, 3)] = 1.0_f64;
+
+            g[(2 * row + 1, 0)] = x_i;
+            g[(2 * row + 1, 1)] = y_i;
+            g[(2 * row + 1, 2)] = z_i;
+            g[(2 * row + 1, 3)] = 1.0_f64;
+            g[(2 * row + 1, 4 + row)] = 1.0_f64;
 
             let mut models = 0.0_f64;
 
@@ -153,13 +144,13 @@ impl Input {
 
             let (pr, frequency) = match cfg.method {
                 Method::SPP => {
-                    let pr = cd[index]
+                    let pr = cd[row]
                         .prefered_pseudorange()
                         .ok_or(Error::MissingPseudoRange)?;
                     (pr.value, pr.carrier.frequency())
                 },
                 Method::CPP | Method::PPP => {
-                    let pr = cd[index]
+                    let pr = cd[row]
                         .code_if_combination()
                         .ok_or(Error::PseudoRangeCombination)?;
                     (pr.value, pr.reference.frequency())
@@ -177,7 +168,7 @@ impl Input {
              * IONO + TROPO biases
              */
             let rtm = BiasRuntimeParams {
-                t: cd[index].t,
+                t: cd[row].t,
                 elevation,
                 azimuth,
                 frequency,
@@ -192,14 +183,14 @@ impl Input {
                     let bias = TroposphereBias::model(TropoModel::Niel, &rtm);
                     debug!(
                         "{}({}): modeled tropo delay {:.3E}[m]",
-                        cd[index].t, cd[index].sv, bias
+                        cd[row].t, cd[row].sv, bias
                     );
                     models += bias;
                     sv_input.tropo_bias = Bias::modeled(bias);
                 } else if let Some(bias) = tropo_bias.bias(&rtm) {
                     debug!(
                         "{}({}): measured tropo delay {:.3E}[m]",
-                        cd[index].t, cd[index].sv, bias
+                        cd[row].t, cd[row].sv, bias
                     );
                     models += bias;
                     sv_input.tropo_bias = Bias::measured(bias);
@@ -213,87 +204,63 @@ impl Input {
                 if let Some(bias) = iono_bias.bias(&rtm) {
                     debug!(
                         "{} : modeled iono delay (f={:.3E}Hz) {:.3E}[m]",
-                        cd[index].t, rtm.frequency, bias
+                        cd[row].t, rtm.frequency, bias
                     );
                     models += bias;
                     sv_input.iono_bias = Bias::modeled(bias);
                 }
             }
 
-            y[i] = pr - rho - models;
+            y[2 * row] = pr - rho - models;
 
-            if i > 5 {
-                g[(i, i)] = 1.0_f64;
+            if cfg.method == Method::PPP {
+                let cmb = cd[row]
+                    .phase_if_combination()
+                    .ok_or(Error::PseudoRangeCombination)?;
 
-                if cfg.method == Method::PPP {
-                    let cmb = cd[index]
-                        .phase_if_combination()
-                        .ok_or(Error::PseudoRangeCombination)?;
+                let f_1 = cmb.reference.frequency();
+                let lambda_j = cmb.lhs.wavelength();
+                let f_j = cmb.lhs.frequency();
 
-                    let f_1 = cmb.reference.frequency();
-                    let lambda_j = cmb.lhs.wavelength();
-                    let f_j = cmb.lhs.frequency();
+                let (lambda_n, lambda_w) =
+                    (SPEED_OF_LIGHT / (f_1 + f_j), SPEED_OF_LIGHT / (f_1 - f_j));
 
-                    let (lambda_n, lambda_w) =
-                        (SPEED_OF_LIGHT / (f_1 + f_j), SPEED_OF_LIGHT / (f_1 - f_j));
+                let bias = if let Some(ambiguity) = ambiguities.get(&(cd[row].sv, cmb.reference)) {
+                    let (n_1, n_w) = (ambiguity.n_1, ambiguity.n_w);
+                    let b_c = lambda_n * (n_1 + (lambda_w / lambda_j) * n_w);
+                    debug!(
+                        "{} ({}/{}) b_c: {}",
+                        cd[row].t, cd[row].sv, cmb.reference, b_c
+                    );
+                    b_c
+                } else {
+                    error!(
+                        "{} ({}/{}): unresolved ambiguity",
+                        cd[row].t, cd[row].sv, cmb.reference
+                    );
+                    return Err(Error::UnresolvedAmbiguity);
+                };
 
-                    let bias =
-                        if let Some(ambiguity) = ambiguities.get(&(cd[index].sv, cmb.reference)) {
-                            let (n_1, n_w) = (ambiguity.n_1, ambiguity.n_w);
-                            let b_c = lambda_n * (n_1 + (lambda_w / lambda_j) * n_w);
-                            debug!(
-                                "{} ({}/{}) b_c: {}",
-                                cd[index].t, cd[index].sv, cmb.reference, b_c
-                            );
-                            b_c
-                        } else {
-                            error!(
-                                "{} ({}/{}): unresolved ambiguity",
-                                cd[index].t, cd[index].sv, cmb.reference
-                            );
-                            return Err(Error::UnresolvedAmbiguity);
-                        };
+                // TODO: conclude windup
+                let windup = 0.0_f64;
 
-                    // TODO: conclude windup
-                    let windup = 0.0_f64;
-
-                    y[i] = cmb.value - rho - models - windup + bias;
-                }
+                y[2 * row + 1] = cmb.value - rho - models - windup + bias;
+            } else {
+                y[2 * row + 1] = y[2 * row];
             }
-
-            if i < cd.len() {
-                sv.insert(cd[i].sv, sv_input);
-            }
+            sv.insert(cd[row].sv, sv_input);
         }
 
-        debug!("y: {} g: {}", y, g);
+        assert!(g.nrows() == y.nrows(), "invalid g matrix formulation");
+        assert!(g.ncols() == cd.len() + 4, "invalid g matrix formulation");
+        debug!(
+            "y({}): {} g({},{}): {}",
+            y.nrows(),
+            y,
+            g.nrows(),
+            g.ncols(),
+            g
+        );
         Ok(Self { y, g, sv })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct Navigation {
-    filter: Filter,
-    pending: Option<Output>,
-    filter_state: Option<FilterState>,
-}
-
-impl Navigation {
-    pub fn new(filter: Filter) -> Self {
-        Self {
-            filter,
-            pending: None,
-            filter_state: None,
-        }
-    }
-    pub fn resolve(&mut self, input: &Input, w: &DMatrix<f64>) -> Result<Output, Error> {
-        let out = self.filter.resolve(input, w, self.filter_state.clone())?;
-        self.pending = Some(out.clone());
-        Ok(out)
-    }
-    pub fn validate(&mut self) {
-        if let Some(pending) = &self.pending {
-            self.filter_state = Some(pending.state.clone());
-        }
     }
 }
