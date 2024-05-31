@@ -84,6 +84,10 @@ fn default_smoothing() -> bool {
     false
 }
 
+fn default_min_elevation() -> f64 {
+    12.0
+}
+
 fn default_sv_clock() -> bool {
     true
 }
@@ -311,8 +315,8 @@ pub struct Config {
     pub min_sv_sunlight_rate: Option<f64>,
     /// Minimal SV elevation angle for an SV to contribute to the solution.
     /// Use this as a simple quality criteria.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub min_sv_elev: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(default = "default_min_elevation"))]
+    pub min_sv_elev: f64,
     /// Minimal SV Azimuth angle for an SV to contribute to the solution.
     /// SV below that angle will not be considered.
     /// Use this is in special navigation scenarios.
@@ -346,7 +350,7 @@ impl Config {
                 interp_order: default_interp(),
                 code_smoothing: default_smoothing(),
                 min_snr: None,
-                min_sv_elev: Some(7.5),
+                min_sv_elev: default_min_elevation(),
                 min_sv_azim: None,
                 max_sv_azim: None,
                 min_sv_sunlight_rate: None,
@@ -371,7 +375,7 @@ impl Config {
                 interp_order: default_interp(),
                 code_smoothing: default_smoothing(),
                 min_snr: None,
-                min_sv_elev: Some(7.5),
+                min_sv_elev: default_min_elevation(),
                 min_sv_azim: None,
                 max_sv_azim: None,
                 min_sv_sunlight_rate: None,
@@ -396,7 +400,7 @@ impl Config {
                 interp_order: default_interp(),
                 code_smoothing: default_smoothing(),
                 min_snr: None,
-                min_sv_elev: Some(7.5),
+                min_sv_elev: default_min_elevation(),
                 min_sv_azim: None,
                 max_sv_azim: None,
                 min_sv_sunlight_rate: None,

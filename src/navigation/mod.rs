@@ -1,5 +1,5 @@
 pub mod solutions;
-pub use solutions::{PVTSolution, PVTSolutionType};
+pub use solutions::{PVTSolution, PVTSolutionType, DOP};
 
 mod filter;
 
@@ -16,7 +16,7 @@ use crate::{
     prelude::{Error, Method, SV},
 };
 
-use nalgebra::{base::dimension::U4, DMatrix, DVector, OMatrix};
+use nalgebra::{DMatrix, DVector};
 
 use nyx::cosmic::SPEED_OF_LIGHT;
 
@@ -42,42 +42,6 @@ pub struct Input {
     pub g: DMatrix<f64>,
     /// SV dependent data
     pub sv: HashMap<SV, SVInput>,
-}
-
-/// Navigation Output
-#[derive(Debug, Clone)]
-pub struct Output {
-    /// Time Dilution of Precision
-    pub tdop: f64,
-    /// Geometric Dilution of Precision
-    pub gdop: f64,
-    /// Position Dilution of Precision
-    pub pdop: f64,
-    /// Q covariance matrix
-    pub q: DMatrix<f64>,
-}
-
-impl Output {
-    pub(crate) fn q_covar4x4(&self) -> OMatrix<f64, U4, U4> {
-        OMatrix::<f64, U4, U4>::new(
-            self.q[(0, 0)],
-            self.q[(0, 1)],
-            self.q[(0, 2)],
-            self.q[(0, 3)],
-            self.q[(1, 0)],
-            self.q[(1, 1)],
-            self.q[(1, 2)],
-            self.q[(1, 3)],
-            self.q[(2, 0)],
-            self.q[(2, 1)],
-            self.q[(2, 2)],
-            self.q[(2, 3)],
-            self.q[(3, 0)],
-            self.q[(3, 1)],
-            self.q[(3, 2)],
-            self.q[(3, 3)],
-        )
-    }
 }
 
 impl Input {
@@ -122,16 +86,16 @@ impl Input {
             let rho = ((sv_x - x0).powi(2) + (sv_y - y0).powi(2) + (sv_z - z0).powi(2)).sqrt();
             let (x_i, y_i, z_i) = ((x0 - sv_x) / rho, (y0 - sv_y) / rho, (z0 - sv_z) / rho);
 
+            g[(row, 0)] = x_i;
+            g[(row, 1)] = y_i;
+            g[(row, 2)] = z_i;
+            g[(row, 3)] = 1.0_f64;
+
             g[(2 * row, 0)] = x_i;
             g[(2 * row, 1)] = y_i;
             g[(2 * row, 2)] = z_i;
             g[(2 * row, 3)] = 1.0_f64;
-
-            g[(2 * row + 1, 0)] = x_i;
-            g[(2 * row + 1, 1)] = y_i;
-            g[(2 * row + 1, 2)] = z_i;
-            g[(2 * row + 1, 3)] = 1.0_f64;
-            g[(2 * row + 1, 4 + row)] = 1.0_f64;
+            g[(2 * row, 4 + row)] = 1.0_f64;
 
             let mut models = 0.0_f64;
 
@@ -211,7 +175,7 @@ impl Input {
                 }
             }
 
-            y[2 * row] = pr - rho - models;
+            y[row] = pr - rho - models;
 
             if cfg.method == Method::PPP {
                 let cmb = cd[row]
@@ -225,7 +189,7 @@ impl Input {
                 let (lambda_n, lambda_w) =
                     (SPEED_OF_LIGHT / (f_1 + f_j), SPEED_OF_LIGHT / (f_1 - f_j));
 
-                let bias = if let Some(ambiguity) = ambiguities.get(&(cd[row].sv, cmb.reference)) {
+                let b_c = if let Some(ambiguity) = ambiguities.get(&(cd[row].sv, cmb.reference)) {
                     let (n_1, n_w) = (ambiguity.n_1, ambiguity.n_w);
                     let b_c = lambda_n * (n_1 + (lambda_w / lambda_j) * n_w);
                     debug!(
@@ -244,15 +208,15 @@ impl Input {
                 // TODO: conclude windup
                 let windup = 0.0_f64;
 
-                y[2 * row + 1] = cmb.value - rho - models - windup + bias;
+                y[2 * row] = cmb.value - rho - models - windup + b_c;
             } else {
-                y[2 * row + 1] = y[2 * row];
+                y[2 * row] = y[row];
             }
             sv.insert(cd[row].sv, sv_input);
         }
 
-        assert!(g.nrows() == y.nrows(), "invalid g matrix formulation");
-        assert!(g.ncols() == cd.len() + 4, "invalid g matrix formulation");
+        assert!(g.nrows() == y.nrows(), "invalid g matrix");
+        assert!(g.ncols() == cd.len() + 4, "invalid g matrix");
         debug!(
             "y({}): {} g({},{}): {}",
             y.nrows(),

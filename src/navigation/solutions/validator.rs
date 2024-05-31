@@ -6,12 +6,12 @@ use thiserror::Error;
 use crate::{
     cfg::SolverOpts,
     navigation::filter::FilterState,
-    navigation::{Input, Output},
+    navigation::{Input, PVTSolution},
     prelude::Candidate,
 };
 
 #[derive(Clone, Debug, Error)]
-pub enum SolutionInvalidation {
+pub enum Error {
     #[error("gdop {0}: limit exceeded")]
     GDOPOutlier(f64),
     #[error("tdop limit exceeded {0}")]
@@ -22,23 +22,28 @@ pub enum SolutionInvalidation {
     CodeResidual(f64),
 }
 
-pub(crate) struct Validator {
-    gdop: f64,
-    tdop: f64,
-    residuals: DVector<f64>,
-}
+/// PVT Solution validator
+pub struct Validator {}
 
 impl Validator {
-    pub fn new(
+    pub fn validate(
         apriori_ecef: Vector3<f64>,
         pool: &[Candidate],
         input: &Input,
+        solution: &PVTSolution,
         w: &DMatrix<f64>,
-        output: &Output,
         state: &FilterState,
-    ) -> Self {
-        let gdop = output.gdop;
-        let tdop = output.tdop;
+        opts: &SolverOpts,
+    ) -> Result<(), Error> {
+        let x = state.estimate();
+
+        let (x, y, z, dt) = (
+            apriori_ecef[0] + x[0],
+            apriori_ecef[1] + x[1],
+            apriori_ecef[2] + x[2],
+            x[3] / SPEED_OF_LIGHT,
+        );
+
         let mut residuals = DVector::<f64>::zeros(pool.len());
 
         for (idx, cd) in pool.iter().enumerate() {
@@ -50,15 +55,6 @@ impl Validator {
                 .unwrap();
 
             let pr = cd.prefered_pseudorange().unwrap().value;
-
-            let x = state.estimate();
-
-            let (x, y, z, dt) = (
-                apriori_ecef[0] + x[0],
-                apriori_ecef[1] + x[1],
-                apriori_ecef[2] + x[2],
-                x[3] / SPEED_OF_LIGHT,
-            );
 
             let sv_pos = cd.state.unwrap().position;
             let (sv_x, sv_y, sv_z) = (sv_pos[0], sv_pos[1], sv_pos[2]);
@@ -81,24 +77,14 @@ impl Validator {
                 w[(idx, idx)]
             );
         }
-        Self {
-            residuals,
-            gdop,
-            tdop,
-        }
-    }
-    /*
-     * Solution validation process
-     */
-    pub fn validate(&self, opts: &SolverOpts) -> Result<(), SolutionInvalidation> {
         if let Some(max_gdop) = opts.gdop_threshold {
-            if self.gdop > max_gdop {
-                return Err(SolutionInvalidation::GDOPOutlier(self.gdop));
+            if solution.dop.gdop > max_gdop {
+                return Err(Error::GDOPOutlier(solution.dop.gdop));
             }
         }
         if let Some(max_tdop) = opts.tdop_threshold {
-            if self.tdop > max_tdop {
-                return Err(SolutionInvalidation::TDOPOutlier(self.tdop));
+            if solution.dop.tdop > max_tdop {
+                return Err(Error::TDOPOutlier(solution.dop.tdop));
             }
         }
         Ok(())

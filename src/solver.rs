@@ -25,8 +25,8 @@ use crate::{
     candidate::Candidate,
     cfg::{Config, Method},
     navigation::{
-        solutions::validator::Validator as SolutionValidator, Filter, FilterState,
-        Input as NavigationInput, PVTSolution, PVTSolutionType,
+        solutions::validator::Validator as SolutionValidator, FilterState,
+        Input as NavigationInput, PVTSolution, PVTSolutionType, DOP,
     },
     position::Position,
     prelude::{Duration, Epoch, SV},
@@ -155,7 +155,8 @@ impl InterpolationResult {
             frame,
         )
     }
-    pub(crate) fn set_elevation(&mut self, elev: f64) {
+    #[cfg(test)]
+    pub fn set_elevation(&mut self, elev: f64) {
         self.elevation = elev;
     }
 }
@@ -189,8 +190,6 @@ where
     /* prev. solution for internal logic */
     /// Previous solution
     prev_solution: Option<(Epoch, PVTSolution)>,
-    /// Previous VDOP
-    prev_vdop: Option<f64>,
     /// Previously used
     prev_used: Vec<SV>,
     /// Stored previous SV state
@@ -222,7 +221,6 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
             earth_frame,
             initial,
             interpolator,
-            prev_vdop: None,
             prev_used: vec![],
             cfg: cfg.clone(),
             prev_solution: None,
@@ -256,6 +254,9 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
         let modeling = self.cfg.modeling;
         let solver_opts = &self.cfg.solver;
         let interp_order = self.cfg.interp_order;
+        let min_sv_elev = self.cfg.min_sv_elev;
+        let min_sv_azim = self.cfg.min_sv_azim.unwrap_or(0.0);
+        let max_sv_azim = self.cfg.max_sv_azim.unwrap_or(360.0);
 
         /* apply signal quality and condition filters */
         let pool: Vec<Candidate> = pool
@@ -302,48 +303,19 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
                 Ok((t_tx, dt_tx)) => {
                     debug!("{} ({}) : signal propagation {}", cd.t, cd.sv, dt_tx);
                     let mut interpolated = (self.interpolator)(t_tx, cd.sv, interp_order)?;
-                    let mut min_elev = self.cfg.min_sv_elev.unwrap_or(0.0_f64);
-                    let mut min_azim = self.cfg.min_sv_azim.unwrap_or(0.0_f64);
-                    let mut max_azim = self.cfg.max_sv_azim.unwrap_or(360.0_f64);
-
-                    // provide more information after first iteration
                     if let Some(initial) = &self.initial {
                         let (x0, y0, z0) = (initial.ecef[0], initial.ecef[1], initial.ecef[2]);
                         interpolated = interpolated.with_elevation_azimuth((x0, y0, z0));
                         debug!("{} ({}) : {:?}", cd.t, cd.sv, interpolated);
-                    } else {
-                        min_elev = 0.0_f64; // cannot apply yet
-                        min_azim = 0.0_f64; // cannot apply yet
-                        max_azim = 360.0_f64; // cannot apply yet
                     }
 
-                    if interpolated.elevation < min_elev {
-                        debug!(
-                            "{} ({}) - {:?} rejected : below elevation mask",
-                            cd.t, cd.sv, interpolated
-                        );
-                        None
-                    } else if interpolated.azimuth < min_azim {
-                        debug!(
-                            "{} ({}) - {:?} rejected : below azimuth mask",
-                            cd.t, cd.sv, interpolated
-                        );
-                        None
-                    } else if interpolated.azimuth > max_azim {
-                        debug!(
-                            "{} ({}) - {:?} rejected : above azimuth mask",
-                            cd.t, cd.sv, interpolated
-                        );
-                        None
-                    } else {
-                        let mut cd = cd.clone();
-                        let interpolated =
-                            Self::rotate_position(modeling.earth_rotation, interpolated, dt_tx);
-                        let interpolated = self.velocities(t_tx, cd.sv, interpolated);
-                        cd.t_tx = t_tx;
-                        cd.state = Some(interpolated);
-                        Some(cd)
-                    }
+                    let mut cd = cd.clone();
+                    let interpolated =
+                        Self::rotate_position(modeling.earth_rotation, interpolated, dt_tx);
+                    let interpolated = self.velocities(t_tx, cd.sv, interpolated);
+                    cd.t_tx = t_tx;
+                    cd.state = Some(interpolated);
+                    Some(cd)
                 },
                 Err(e) => {
                     error!("{} - transmision time error: {}", cd.sv, e);
@@ -410,7 +382,7 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
             let geo = position.geodetic();
             let (lat, lon) = (rad2deg(geo[0]), rad2deg(geo[1]));
             debug!(
-                "{} - estimated initial position lat={:.3E}°, lon={:.3E}°",
+                "{} - estimated initial position lat={:.5}°, lon={:.5}°",
                 pool[0].t, lat, lon
             );
             // update attitudes
@@ -437,7 +409,7 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
         //   [+] retain best elev
         //   [+] make sure we're still compliant
         //   [+] sort by PRN to form consistant matrix
-        Self::retain_best_elevation(&mut pool, min_required);
+        Self::retain_geometry(&mut pool, min_sv_elev, min_sv_azim, max_sv_azim);
         if pool.len() < min_required {
             return Err(Error::NotEnoughMatchingCandidates);
         }
@@ -445,11 +417,8 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
 
         let initial = self.initial.as_ref().unwrap();
         let (x0, y0, z0) = (initial.ecef()[0], initial.ecef()[1], initial.ecef()[2]);
-        let (lat_rad, lon_rad, altitude_above_sea_m) = (
-            initial.geodetic()[0],
-            initial.geodetic()[1],
-            initial.geodetic()[2],
-        );
+        let geo = initial.geodetic();
+        let (lat_rad, lon_rad, altitude_above_sea_m) = (geo[0], geo[1], geo[2]);
         let (lat_ddeg, lon_ddeg) = (deg2rad(lat_rad), deg2rad(lon_rad));
 
         let w = self.cfg.solver.weight_matrix(pool.len() * 2);
@@ -480,13 +449,13 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
         debug!("w: {}", w);
 
         // update navigation state
-        let output = match self.state.update(&input, &w) {
-            Ok(output) => output,
+        match self.state.update(&input, &w) {
+            Ok(_) => {},
             Err(e) => {
                 error!("Failed to resolve: {}", e);
                 return Err(Error::NavigationError);
             },
-        };
+        }
 
         self.prev_used = pool.iter().map(|cd| cd.sv).collect::<Vec<_>>();
 
@@ -503,41 +472,37 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
         };
 
         let mut solution = PVTSolution {
-            gdop: output.gdop,
-            tdop: output.tdop,
-            pdop: output.pdop,
-            sv: input.sv.clone(),
-            q: output.q_covar4x4(),
-            timescale: self.cfg.timescale,
             position,
+            sv: input.sv.clone(),
+            dop: DOP::new(&pool, x)?,
+            timescale: self.cfg.timescale,
             velocity: Vector3::<f64>::default(),
             dt: Duration::from_seconds(x[3] / SPEED_OF_LIGHT),
         };
 
-        // First solution
+        // First solution is internally valid but not proposed externally
         if self.prev_solution.is_none() {
-            self.prev_vdop = Some(solution.vdop(lat_rad, lon_rad));
             self.prev_solution = Some((t, solution.clone()));
-            // always discard 1st solution
             return Err(Error::InvalidatedSolution);
         }
 
-        let validator = SolutionValidator::new(
+        match SolutionValidator::validate(
             Vector3::<f64>::new(x0, y0, z0),
             &pool,
             &input,
+            &solution,
             &w,
-            &output,
             &self.state,
-        );
-
-        match validator.validate(solver_opts) {
+            &self.cfg.solver,
+        ) {
             Ok(_) => {
                 // self.nav.validate();
             },
             Err(e) => {
-                error!("solution invalidated - {}", e);
-                return Err(Error::InvalidatedSolution);
+                if self.state.nth() == 1 {
+                    error!("solution invalidated - {}", e);
+                    return Err(Error::InvalidatedSolution);
+                }
             },
         };
 
@@ -699,16 +664,37 @@ impl<I: std::ops::Fn(Epoch, SV, usize) -> Option<InterpolationResult>> Solver<I>
 
     //    candidates.retain(|cd| retained.contains(&cd.sv));
     //}
-    fn retain_best_elevation(pool: &mut Vec<Candidate>, min_required: usize) {
-        let mut index = 0;
+    fn retain_geometry(
+        pool: &mut Vec<Candidate>,
+        min_elevation: f64,
+        min_azimuth: f64,
+        max_azimuth: f64,
+    ) {
+        //let mut index = 0;
+        //let total = pool.len();
+        //pool.sort_by(|cd_a, cd_b| {
+        //    let state_a = cd_a.state.unwrap();
+        //    let state_b = cd_b.state.unwrap();
+        //    state_a.elevation.partial_cmp(&state_b.elevation).unwrap()
+        //});
+
         pool.retain(|cd| {
+            //index += 1;
+            //index > total - min_required
             let state = cd.state.unwrap();
-            if state.elevation > 10.0 {
-                index += 1;
-                index <= min_required
-            } else {
-                false
+            let retained_min_elev = state.elevation > min_elevation;
+            let retained_min_azim = state.azimuth > min_azimuth;
+            let retained_max_azim = state.azimuth < max_azimuth;
+            if !retained_min_elev {
+                debug!("{} ({}) - rejected : below elevation mask", cd.t, cd.sv,);
             }
+            if !retained_min_azim {
+                debug!("{} ({}) - rejected : below azimuth mask", cd.t, cd.sv,);
+            }
+            if !retained_max_azim {
+                debug!("{} ({}) - rejected : above azimuth mask", cd.t, cd.sv);
+            }
+            retained_min_elev && retained_min_azim && retained_max_azim
         });
     }
 }
